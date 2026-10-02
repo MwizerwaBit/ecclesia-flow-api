@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator, Callable
 from typing import Annotated
 
 from fastapi import Depends, Header
-from sqlalchemy.ext.asyncio import AsyncSession
+from prisma import Prisma
 
 from app.core.database import platform_session, tenant_session, unscoped_tenant_session
 from app.core.exceptions import ForbiddenError, StepUpRequiredError, UnauthorizedError
@@ -37,24 +37,24 @@ async def get_current_claims(
 CurrentClaims = Annotated[AccessTokenClaims, Depends(get_current_claims)]
 
 
-async def get_tenant_db(claims: CurrentClaims) -> AsyncGenerator[AsyncSession, None]:
+async def get_tenant_db(claims: CurrentClaims) -> AsyncGenerator[Prisma, None]:
     if not claims.tenant_id:
         raise ForbiddenError("No active church selected for this session")
-    async with tenant_session(claims.tenant_id, claims.sub) as session:
-        yield session
+    async with tenant_session(claims.tenant_id, claims.sub) as tx:
+        yield tx
 
 
-TenantDb = Annotated[AsyncSession, Depends(get_tenant_db)]
+TenantDb = Annotated[Prisma, Depends(get_tenant_db)]
 
 
-async def get_pre_tenant_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_pre_tenant_db() -> AsyncGenerator[Prisma, None]:
     """For the handful of endpoints that run before a tenant context exists
     (registration, the public church directory lookup)."""
-    async with unscoped_tenant_session() as session:
-        yield session
+    async with unscoped_tenant_session() as tx:
+        yield tx
 
 
-PreTenantDb = Annotated[AsyncSession, Depends(get_pre_tenant_db)]
+PreTenantDb = Annotated[Prisma, Depends(get_pre_tenant_db)]
 
 
 async def require_platform_admin(claims: CurrentClaims) -> AccessTokenClaims:
@@ -66,12 +66,12 @@ async def require_platform_admin(claims: CurrentClaims) -> AccessTokenClaims:
 PlatformClaims = Annotated[AccessTokenClaims, Depends(require_platform_admin)]
 
 
-async def get_platform_db(_: PlatformClaims) -> AsyncGenerator[AsyncSession, None]:
-    async with platform_session() as session:
-        yield session
+async def get_platform_db(_: PlatformClaims) -> AsyncGenerator[Prisma, None]:
+    async with platform_session() as tx:
+        yield tx
 
 
-PlatformDb = Annotated[AsyncSession, Depends(get_platform_db)]
+PlatformDb = Annotated[Prisma, Depends(get_platform_db)]
 
 
 def require_platform_admin_level(level: str) -> Callable:

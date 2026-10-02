@@ -3,9 +3,20 @@ import uuid
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-import app.db.models_registry  # noqa: F401 — must load before any ORM use
+from app.core.database import connect_clients, disconnect_clients
 from app.core.rate_limit import limiter
 from app.main import app
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def _prisma_lifecycle():
+    # httpx's ASGITransport doesn't run the ASGI lifespan protocol, so the
+    # app's own `lifespan=` (which connects/disconnects the Prisma clients)
+    # never fires in tests — connect/disconnect explicitly instead, once for
+    # the whole session.
+    await connect_clients()
+    yield
+    await disconnect_clients()
 
 
 @pytest.fixture(autouse=True)

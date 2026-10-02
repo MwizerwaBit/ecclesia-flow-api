@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Query
+from prisma.models import Organization
 
 from app.core.deps import PreTenantDb
 from app.core.exceptions import NotFoundError
 from app.modules.tenant import repository
-from app.modules.tenant.models import Organization
 from app.modules.tenant.schemas import PublicChurchSummary
 
 router = APIRouter(prefix="/churches", tags=["church-directory"])

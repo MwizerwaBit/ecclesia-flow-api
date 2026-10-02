@@ -1,42 +1,35 @@
-import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.modules.tenant.models import Organization
+from prisma import Prisma
+from prisma.models import Organization
 
 DISCOVERABLE_STATUSES = ("trial", "active")
 
 
-async def get_by_slug(db: AsyncSession, slug: str) -> Organization | None:
-    result = await db.execute(select(Organization).where(Organization.slug == slug))
-    return result.scalar_one_or_none()
+async def get_by_slug(db: Prisma, slug: str) -> Organization | None:
+    return await db.organization.find_unique(where={"slug": slug})
 
 
-async def get_by_id(db: AsyncSession, org_id: str | uuid.UUID) -> Organization | None:
-    result = await db.execute(select(Organization).where(Organization.id == org_id))
-    return result.scalar_one_or_none()
+async def get_by_id(db: Prisma, org_id: str) -> Organization | None:
+    return await db.organization.find_unique(where={"id": org_id})
 
 
-async def slug_exists(db: AsyncSession, slug: str) -> bool:
+async def slug_exists(db: Prisma, slug: str) -> bool:
     return await get_by_slug(db, slug) is not None
 
 
-async def search_public(db: AsyncSession, query: str | None) -> list[Organization]:
-    stmt = select(Organization).where(Organization.status.in_(DISCOVERABLE_STATUSES))
+async def search_public(db: Prisma, query: str | None) -> list[Organization]:
+    where: dict = {"status": {"in": list(DISCOVERABLE_STATUSES)}}
     if query:
-        like = f"%{query.lower()}%"
-        stmt = stmt.where(
-            or_(Organization.display_name.ilike(like), Organization.slug.ilike(like))
-        )
-    stmt = stmt.order_by(Organization.display_name).limit(50)
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
+        where["OR"] = [
+            {"display_name": {"contains": query, "mode": "insensitive"}},
+            {"slug": {"contains": query, "mode": "insensitive"}},
+        ]
+    return await db.organization.find_many(where=where, order={"display_name": "asc"}, take=50)
 
 
 async def create_organization(
-    db: AsyncSession,
+    db: Prisma,
     *,
     legal_name: str,
     display_name: str,
@@ -45,18 +38,16 @@ async def create_organization(
     currency: str,
     timezone_name: str,
 ) -> Organization:
-    org = Organization(
-        id=uuid.uuid4(),
-        legal_name=legal_name,
-        display_name=display_name,
-        slug=slug,
-        country=country.upper(),
-        currency=currency.upper(),
-        timezone=timezone_name,
-        status="trial",
-        tier="seed",
-        trial_ends_at=datetime.now(UTC) + timedelta(days=30),
+    return await db.organization.create(
+        data={
+            "legal_name": legal_name,
+            "display_name": display_name,
+            "slug": slug,
+            "country": country.upper(),
+            "currency": currency.upper(),
+            "timezone": timezone_name,
+            "status": "trial",
+            "tier": "seed",
+            "trial_ends_at": datetime.now(UTC) + timedelta(days=30),
+        }
     )
-    db.add(org)
-    await db.flush()
-    return org

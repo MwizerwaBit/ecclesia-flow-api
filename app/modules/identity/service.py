@@ -1,10 +1,11 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from prisma import Prisma
+from prisma.models import User
 
 from app.core.config import get_settings
+from app.core.database import tenant_client
 from app.core.exceptions import ForbiddenError, NotFoundError, UnauthorizedError
 from app.core.security import (
     TokenError,
@@ -27,7 +28,6 @@ from app.core.security import (
 )
 from app.modules.audit.service import write_audit
 from app.modules.identity import repository
-from app.modules.identity.models import User
 from app.modules.identity.schemas import (
     MembershipSummary,
     MfaChallengeResponse,
@@ -43,11 +43,11 @@ from app.modules.rbac.service import resolve_permissions
 from app.modules.tenant.service import create_organization_with_root_unit
 
 
-async def _set_user_scope(db: AsyncSession, user_id: uuid.UUID) -> None:
-    await db.execute(text("select set_config('app.user_id', :v, true)"), {"v": str(user_id)})
+async def _set_user_scope(db: Prisma, user_id: str) -> None:
+    await db.execute_raw("select set_config('app.user_id', $1, true)", user_id)
 
 
-async def _membership_summaries(db: AsyncSession, user_id: uuid.UUID) -> list[MembershipSummary]:
+async def _membership_summaries(db: Prisma, user_id: str) -> list[MembershipSummary]:
     await _set_user_scope(db, user_id)
     rows = await repository.list_memberships_for_user(db, user_id)
     return [
@@ -65,15 +65,15 @@ async def _membership_summaries(db: AsyncSession, user_id: uuid.UUID) -> list[Me
 
 
 async def _issue_tokens_for_membership(
-    db: AsyncSession,
+    db: Prisma,
     *,
     user: User,
     membership_summary: MembershipSummary | None,
     all_memberships: list[MembershipSummary],
     user_agent: str | None,
     ip_address: str | None,
-    reuse_family_id: uuid.UUID | None = None,
-) -> SessionResponse:
+    reuse_family_id: str | None = None,
+):
     """Mints a fresh access token AND a fresh refresh token.
 
     ``reuse_family_id`` is set only by the refresh-rotation path: the new
@@ -81,9 +81,9 @@ async def _issue_tokens_for_membership(
     replaces, so a reuse of any earlier token in the chain still burns the
     whole family, not just the newest link."""
     permissions: list[str] = []
-    role_id: uuid.UUID | None = None
+    role_id: str | None = None
     if membership_summary is not None:
-        membership = await repository.get_membership(db, membership_summary.id)
+        membership = await repository.get_membership(db, str(membership_summary.id))
         role_id = membership.role_id
         permissions = await resolve_permissions(db, role_id)
 
@@ -104,28 +104,31 @@ async def _issue_tokens_for_membership(
     new_token_row = await repository.store_refresh_token(
         db,
         user_id=user.id,
-        membership_id=membership_summary.id if membership_summary else None,
+        membership_id=str(membership_summary.id) if membership_summary else None,
         token_hash=hash_refresh_token(raw_refresh),
-        family_id=reuse_family_id or uuid.uuid4(),
+        family_id=reuse_family_id or str(uuid.uuid4()),
         expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_ttl_days),
         user_agent=user_agent,
         ip_address=ip_address,
     )
 
-    return SessionResponse(
-        access_token=access_token,
-        refresh_token=raw_refresh,
-        user=UserPublic.model_validate(user),
-        active_membership=membership_summary,
-        memberships=all_memberships,
-        permissions=permissions,
-        role=SYSTEM_ROLE_NAMES.get(role_id) if role_id else None,
-        unit_scope_id=membership_summary.unit_scope_id if membership_summary else None,
-    ), new_token_row
+    return (
+        SessionResponse(
+            access_token=access_token,
+            refresh_token=raw_refresh,
+            user=UserPublic.model_validate(user),
+            active_membership=membership_summary,
+            memberships=all_memberships,
+            permissions=permissions,
+            role=SYSTEM_ROLE_NAMES.get(role_id) if role_id else None,
+            unit_scope_id=membership_summary.unit_scope_id if membership_summary else None,
+        ),
+        new_token_row,
+    )
 
 
 async def register_church_leader(
-    db: AsyncSession, payload: RegisterRequest, *, user_agent: str | None, ip_address: str | None
+    db: Prisma, payload: RegisterRequest, *, user_agent: str | None, ip_address: str | None
 ) -> SessionResponse:
     """Onboarding's first step, per plan.md Phase 1 + the frontend brief:
     "onboarding begins with registering the church leader." One transaction:
@@ -195,7 +198,7 @@ async def register_church_leader(
 
 
 async def authenticate(
-    db: AsyncSession, *, email: str, password: str, user_agent: str | None, ip_address: str | None
+    db: Prisma, *, email: str, password: str, user_agent: str | None, ip_address: str | None
 ) -> SessionResponse | MfaChallengeResponse:
     user = await repository.get_user_by_email(db, email.lower())
     # Constant-shape failure: a wrong password and a nonexistent email return
@@ -223,7 +226,7 @@ async def authenticate(
 
 
 async def complete_mfa_challenge(
-    db: AsyncSession, *, challenge_token: str, code: str, user_agent: str | None, ip_address: str | None
+    db: Prisma, *, challenge_token: str, code: str, user_agent: str | None, ip_address: str | None
 ) -> SessionResponse:
     try:
         payload = decode_token(challenge_token)
@@ -253,7 +256,7 @@ async def complete_mfa_challenge(
     return session
 
 
-async def _verify_code_or_backup(db: AsyncSession, user: User, code: str) -> bool:
+async def _verify_code_or_backup(db: Prisma, user: User, code: str) -> bool:
     secret = decrypt_mfa_secret(user.mfa_secret)
     if verify_totp(secret, code):
         return True
@@ -271,7 +274,7 @@ async def _verify_code_or_backup(db: AsyncSession, user: User, code: str) -> boo
 
 
 async def switch_tenant(
-    db: AsyncSession, *, user_id: uuid.UUID, membership_id: uuid.UUID, user_agent: str | None, ip_address: str | None
+    db: Prisma, *, user_id: str, membership_id: str, user_agent: str | None, ip_address: str | None
 ) -> SessionResponse:
     await _set_user_scope(db, user_id)
     membership = await repository.get_membership(db, membership_id)
@@ -279,7 +282,7 @@ async def switch_tenant(
         raise NotFoundError("No such membership for this account")
     user = await repository.get_user_by_id(db, user_id)
     memberships = await _membership_summaries(db, user_id)
-    target = next(m for m in memberships if m.id == membership_id)
+    target = next(m for m in memberships if str(m.id) == membership_id)
     session, _ = await _issue_tokens_for_membership(
         db,
         user=user,
@@ -292,7 +295,7 @@ async def switch_tenant(
 
 
 async def refresh_session(
-    db: AsyncSession, *, raw_refresh_token: str, user_agent: str | None, ip_address: str | None
+    db: Prisma, *, raw_refresh_token: str, user_agent: str | None, ip_address: str | None
 ) -> SessionResponse:
     token_hash = hash_refresh_token(raw_refresh_token)
     row = await repository.get_refresh_token_by_hash(db, token_hash)
@@ -300,11 +303,15 @@ async def refresh_session(
         raise UnauthorizedError("Invalid refresh token")
     if row.revoked_at is not None:
         # Reuse of an already-rotated token: treat as theft, burn the chain.
-        # Committed immediately, before raising — the caller's request-scoped
-        # session normally rolls back on an exception, which would otherwise
-        # silently undo this exact revocation and leave the stolen chain live.
-        await repository.revoke_refresh_token_family(db, row.family_id)
-        await db.commit()
+        # Run in its OWN transaction, independent of the caller's — the
+        # caller's request-scoped transaction rolls back when this function
+        # raises below, which would otherwise silently undo this exact
+        # revocation and leave the stolen chain live (see
+        # docs/SECURITY_NOTES.md §2 — Prisma has no mid-transaction manual
+        # commit, so "commit before raising" has to mean a separate
+        # transaction, not a call on this one).
+        async with tenant_client.tx() as revoke_tx:
+            await repository.revoke_refresh_token_family(revoke_tx, row.family_id)
         raise UnauthorizedError("Refresh token reuse detected — all sessions for this device chain were revoked")
     if row.expires_at < datetime.now(UTC):
         raise UnauthorizedError("Refresh token has expired")
@@ -316,7 +323,7 @@ async def refresh_session(
     memberships = await _membership_summaries(db, user.id)
     target = None
     if row.membership_id:
-        target = next((m for m in memberships if m.id == row.membership_id), None)
+        target = next((m for m in memberships if str(m.id) == row.membership_id), None)
     if target is None:
         target = next((m for m in memberships if m.is_primary), memberships[0] if memberships else None)
 
@@ -333,13 +340,13 @@ async def refresh_session(
     return response
 
 
-async def revoke_refresh_token(db: AsyncSession, raw_refresh_token: str) -> None:
+async def revoke_refresh_token(db: Prisma, raw_refresh_token: str) -> None:
     row = await repository.get_refresh_token_by_hash(db, hash_refresh_token(raw_refresh_token))
     if row is not None and row.revoked_at is None:
         await repository.revoke_refresh_token(db, row.id)
 
 
-async def start_mfa_setup(db: AsyncSession, user: User) -> MfaSetupResponse:
+async def start_mfa_setup(db: Prisma, user: User) -> MfaSetupResponse:
     secret = generate_totp_secret()
     backup_codes = generate_backup_codes()
     await repository.set_mfa(
@@ -356,7 +363,7 @@ async def start_mfa_setup(db: AsyncSession, user: User) -> MfaSetupResponse:
     )
 
 
-async def verify_mfa_setup(db: AsyncSession, user: User, code: str) -> None:
+async def verify_mfa_setup(db: Prisma, user: User, code: str) -> None:
     if not user.mfa_secret:
         raise ForbiddenError("No MFA setup is in progress for this account")
     secret = decrypt_mfa_secret(user.mfa_secret)
@@ -365,11 +372,11 @@ async def verify_mfa_setup(db: AsyncSession, user: User, code: str) -> None:
     await repository.set_mfa(db, user.id, enabled=True, secret=user.mfa_secret, backup_codes=user.mfa_backup_codes)
 
 
-async def disable_mfa(db: AsyncSession, user: User) -> None:
+async def disable_mfa(db: Prisma, user: User) -> None:
     await repository.set_mfa(db, user.id, enabled=False, secret=None, backup_codes=None)
 
 
-async def issue_step_up_token(db: AsyncSession, user: User, code: str, tenant_id: uuid.UUID | None) -> StepUpResponse:
+async def issue_step_up_token(db: Prisma, user: User, code: str, tenant_id: str | None) -> StepUpResponse:
     if not user.mfa_enabled or not user.mfa_secret:
         raise ForbiddenError("Step-up re-authentication requires MFA to be enabled on this account")
     if not await _verify_code_or_backup(db, user, code):

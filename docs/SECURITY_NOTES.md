@@ -32,7 +32,7 @@ connection — even an entirely unrelated, un-scoped one — inherits `''`, and
 `''::uuid` is a hard cast error, not a harmless non-match.
 
 **Fix:** every policy calls `current_tenant_id()` / `current_app_user_id()`
-(defined in `alembic/versions/c7dc285932d3_security_and_seed.py`), two tiny SQL
+(defined in `prisma/migrations/20261002090126_init/migration.sql`), two tiny SQL
 functions that wrap `nullif(current_setting(...), '')::uuid`. Never write a raw
 `current_setting('app.tenant_id', true)::uuid` in a new policy — it will work
 fine in isolation and then fail intermittently under connection pooling.
@@ -53,10 +53,18 @@ silently undoes the revocation UPDATE that was supposed to burn the stolen token
 chain. The client got the correct-looking error message; the database didn't
 actually revoke anything, and the "burned" tokens kept working.
 
-**Fix:** `await db.commit()` immediately after the revoke, before raising. Any
-future "detect and punish" code path (lockouts, abuse flags, etc.) needs the same
-pattern — a write that must survive an error response has to commit before that
-response's exception is raised, not after.
+**Fix (original, SQLAlchemy):** `await db.commit()` immediately after the
+revoke, before raising.
+
+**Updated for Prisma:** `Prisma.tx()`'s transaction object has no public
+mid-transaction commit call — only the `async with` block's own normal exit
+commits it. So the fix became "run the revoke in its own, separate
+transaction" instead of "commit early in this one": see
+`app/modules/identity/service.py::refresh_session`, which opens a fresh
+`tenant_client.tx()` just for `revoke_refresh_token_family` and lets it exit
+(and commit) normally, THEN raises in the outer, unrelated scope. Same
+principle either way — a write that must survive an error response can't
+share a transaction with the exception that reports that error.
 
 ## 3. A custom Pydantic validator's `ValueError` crashes the validation handler
 
@@ -82,6 +90,28 @@ point of a *backup* code (one-time use in case the authenticator device is
 unavailable). Fixed by removing the matched hash from the stored array and
 persisting that immediately on the same request that verified it
 (`app/modules/identity/service.py::_verify_code_or_backup`).
+
+## 5. Prisma-specific pitfalls found switching off SQLAlchemy
+
+Not security bugs, but correctness traps worth knowing about if you touch the
+repository layer:
+
+- **A nullable `Json` field rejects an explicit `None`.** Passing
+  `{"metadata": None}` to `db.auditlog.create(...)` raises
+  `MissingRequiredValueError` even though the column is nullable — Prisma's
+  input type wants the key **omitted entirely** for "no value," not
+  present-and-`None`. See `app/modules/audit/service.py::write_audit`, which
+  only adds the `metadata` key to the `data` dict when a value is actually
+  given.
+- **`uuid.UUID` objects aren't JSON-serializable by Prisma's query builder.**
+  Every ID that crosses into a `db.<model>.*()` call has to be a plain `str`
+  — Prisma's Python client serializes query arguments to JSON internally, and
+  a raw `uuid.UUID` (which Pydantic happily parses path/body params into)
+  fails with `TypeError: Type <class 'uuid.UUID'> not serializable` deep
+  inside the query builder, not at the API boundary. Pydantic schemas that
+  validate an ID as `uuid.UUID` (worth keeping, for the input validation) must
+  convert with `str(...)` at the router before handing it to a service/
+  repository function.
 
 ## Known, deliberately deferred
 

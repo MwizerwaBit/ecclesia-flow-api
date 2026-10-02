@@ -2,14 +2,15 @@
 
 The backend for the EcclesiaFlow frontend (`../ecclesia-flow-app`), built against
 `docs/database-design.md` (in that repo) and `plan.md`'s architecture roadmap: FastAPI,
-PostgreSQL via SQLAlchemy 2.0 async, strict multi-tenant isolation via Postgres
+PostgreSQL via Prisma (`prisma-client-py`), strict multi-tenant isolation via Postgres
 Row-Level Security, and `resource:action` RBAC + unit-scope ABAC.
 
 ## What's built so far
 
-**Phase 0 — Base architecture.** Project layout (`app/modules/<name>/{models,schemas,repository,service,router}.py`
-per module, per plan.md's "Strict Domain Scaffolding" guardrail), Pydantic settings,
-async SQLAlchemy engine/session machinery, Alembic async migrations.
+**Phase 0 — Base architecture.** Project layout (`app/modules/<name>/{schemas,repository,service,router}.py`
+per module, per plan.md's "Strict Domain Scaffolding" guardrail — `models.py` is
+Prisma-generated now, not hand-written per module, see below), Pydantic settings,
+Prisma schema + migrations.
 
 **Phase 1 — `identity` & `tenant`**, fully implemented and integration-tested:
 
@@ -30,18 +31,18 @@ async SQLAlchemy engine/session machinery, Alembic async migrations.
   15-minute access token.
 - `GET /churches`, `GET /churches/{slug}` — the public, unauthenticated church
   directory (suspended/canceled orgs 404 like they don't exist).
-- Every table from `docs/database-design.md` exists as both a SQLAlchemy model and
-  a migrated Postgres table, so later phases build on a complete schema rather than
-  adding tables as they go.
+- Every table from `docs/database-design.md` exists in `prisma/schema.prisma` and
+  as a migrated Postgres table, so later phases build on a complete schema rather
+  than adding tables as they go.
 
 **Security hardening applied across the board** (see `docs/SECURITY_NOTES.md` for
-the two non-obvious bugs this surfaced): Postgres RLS on every tenant table (not
-just the ones with a `NOT NULL tenant_id` — `roles`/`role_permissions` got an
-explicit policy too, closing a gap the generic approach misses), two DB roles
-(`app_tenant` RLS-bound, `app_platform` bypassrls for the platform-admin service,
-not yet built), rate limiting on auth endpoints, security headers, request-id
-correlation, and a single exception-handling path that never leaks a stack trace,
-SQL fragment, or internal path to a client.
+the real bugs this surfaced, including two specific to the Prisma rewrite): Postgres
+RLS on every tenant table (not just the ones with a `NOT NULL tenant_id` —
+`roles`/`role_permissions` got an explicit policy too, closing a gap the generic
+approach misses), two DB roles (`app_tenant` RLS-bound, `app_platform` bypassrls for
+the platform-admin service, not yet built), rate limiting on auth endpoints, security
+headers, request-id correlation, and a single exception-handling path that never
+leaks a stack trace, SQL fragment, or internal path to a client.
 
 ## Not built yet
 
@@ -52,19 +53,52 @@ platform-admin, and the frontend-type endpoints those modules would expose. The
 mock services in `ecclesia-flow-app/src/services/` still back the frontend for
 all of that.
 
+## Why Prisma, and how the schema is organized
+
+Prisma doesn't support Row-Level Security, Postgres functions/triggers, or partial
+indexes in `schema.prisma` directly, so the split is:
+
+- `prisma/schema.prisma` — every table's columns and basic constraints (uniques,
+  composite PKs). **Deliberately relation-free**: a foreign key is a plain scalar
+  column (`tenant_id String @db.Uuid`), never a Prisma `@relation`. Declaring one
+  would force a back-reference array field onto the referenced model for every
+  table that points at it — `Organization` alone would need ~15 — and the app
+  never traverses these via Prisma's `include`, it always queries the child table
+  directly, filtered by `tenant_id` (the same shape RLS itself enforces).
+- `prisma/migrations/20261002090126_init/migration.sql` — the actual foreign key
+  `CONSTRAINT`s, check constraints, partial/composite indexes, RLS policies, the
+  closure-table trigger, the `execute_member_transfer` function, system-role seed
+  data, and the two database roles. Prisma generated the `CREATE TABLE` statements
+  at the top; everything below the `══...══` divider comment is hand-written.
+
+Generated model classes (`prisma.models.User`, `.Organization`, etc.) and the
+client (`from prisma import Prisma`) come from running `prisma generate` — there's
+no equivalent of SQLAlchemy's hand-written model files to keep in sync.
+
 ## Local setup
 
+This assumes a native PostgreSQL install already running on `localhost:5432` (not
+Docker) with a login role that has `CREATEDB`:
+
 ```bash
-cp .env.example .env            # edit if you change ports/passwords
-docker compose up -d            # Postgres on localhost:55433
+# One-time: create the database (adjust user/password to match your install)
+psql -U <your_pg_user> -d postgres -c "create database ecclesia_flow"
+
+cp .env.example .env            # edit DATABASE_URL etc. to match your install
 python -m venv .venv && source .venv/Scripts/activate   # or .venv/bin/activate on macOS/Linux
 pip install -e ".[dev]"
-alembic upgrade head             # extensions -> schema -> RLS/seed/db-roles
+python -m prisma migrate deploy  # applies prisma/migrations/ in order
+python -m prisma generate        # regenerates the client (migrate deploy does NOT do this)
 uvicorn app.main:app --reload --port 8001
 ```
 
 Open http://127.0.0.1:8001/docs for interactive OpenAPI docs (disabled automatically
 when `ENVIRONMENT=production`).
+
+**A note on `prisma migrate dev`:** it works, but in a non-interactive shell it can
+hang waiting for a migration-name prompt after applying — use `migrate deploy` (just
+applies pending migrations, no prompts) day-to-day, and only reach for `migrate dev`
+interactively when you're actually adding a new migration.
 
 ### Running tests
 
@@ -81,13 +115,16 @@ login failure-shape, refresh rotation + theft detection, MFA setup/verify/challe
 
 ### Database roles
 
-Migrations run as the superuser (`ecclesia_admin` in `.env`'s `DATABASE_URL`) and
-create two additional roles the running API actually connects as:
+The migration creates two roles the running API actually connects as (the
+`DATABASE_URL` owner account — e.g. `ecclesiaDb` — is for migrations only, never
+for request-serving traffic):
 
 - `app_tenant` — every ordinary request. RLS-bound.
 - `app_platform` — reserved for the platform-admin service (not yet built).
   Bypasses RLS; every connection on it is expected to pair with an explicit
   `audit_logs` write with `tenant_id = null`.
 
-If you reset the database (`docker compose down -v`), migrations recreate both
-roles from `APP_TENANT_DB_PASSWORD`/`APP_PLATFORM_DB_PASSWORD` in `.env`.
+Their passwords are set from the migration SQL (`change_me_tenant_pw` /
+`change_me_platform_pw` by default) and must match `APP_TENANT_DB_PASSWORD` /
+`APP_PLATFORM_DB_PASSWORD` in `.env`. If you change them, update both the running
+database (`ALTER ROLE app_tenant PASSWORD '...'`) and `.env` together.

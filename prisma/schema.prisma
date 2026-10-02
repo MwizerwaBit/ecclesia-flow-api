@@ -1,0 +1,499 @@
+// EcclesiaFlow — Prisma schema.
+//
+// Deliberately relation-free: every foreign key is a plain scalar column
+// (e.g. `tenant_id String @db.Uuid`), not a Prisma `@relation`. Declaring a
+// relation would force a back-reference array field onto the referenced
+// model for every single table that points at it — Organization alone would
+// need ~15 of them — and the app never actually traverses these via
+// Prisma's `include`, it always queries the child table directly, filtered
+// by tenant_id (the same shape RLS itself enforces). The actual foreign key
+// CONSTRAINTS still exist in Postgres — they're added as raw SQL in the
+// migration, alongside Row-Level Security, the closure-table trigger, the
+// member-transfer function, and seed data (see migrations/*/migration.sql).
+//
+// Field names are snake_case to match the database columns 1:1 — no @map
+// needed anywhere except model-to-table (@@map).
+
+generator client {
+  provider                  = "prisma-client-py"
+  interface                 = "asyncio"
+  recursive_type_depth      = 5
+  enable_experimental_decimal = true
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Identity & tenancy ─────────────────────────────
+
+model Organization {
+  id              String    @id @default(uuid()) @db.Uuid
+  legal_name      String
+  display_name    String
+  slug            String    @unique
+  country         String    @db.Char(2)
+  currency        String    @db.Char(3)
+  timezone        String
+  language        String    @default("en")
+  status          String    @default("trial")
+  tier            String    @default("seed")
+  logo_url        String?
+  primary_color   String?
+  custom_domain   String?   @unique
+  trial_ends_at   DateTime? @db.Timestamptz(6)
+  renewal_date    DateTime? @db.Timestamptz(6)
+  storage_used_mb Int       @default(0)
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@map("organizations")
+}
+
+model User {
+  id                   String    @id @default(uuid()) @db.Uuid
+  email                String    @unique @db.Citext
+  password_hash        String?
+  first_name           String
+  last_name            String
+  photo_url            String?
+  is_platform_admin    Boolean   @default(false)
+  platform_admin_level String?
+  mfa_enabled          Boolean   @default(false)
+  mfa_secret           String?
+  mfa_backup_codes     String[]
+  status               String    @default("active")
+  created_at           DateTime  @default(now()) @db.Timestamptz(6)
+  last_login_at        DateTime? @db.Timestamptz(6)
+
+  @@map("users")
+}
+
+model TenantMembership {
+  id             String    @id @default(uuid()) @db.Uuid
+  user_id        String    @db.Uuid
+  tenant_id      String    @db.Uuid
+  role_id        String    @db.Uuid
+  unit_scope_id  String?   @db.Uuid
+  status         String    @default("active")
+  is_primary     Boolean   @default(false)
+  is_leader      Boolean   @default(false)
+  invited_at     DateTime? @db.Timestamptz(6)
+  accepted_at    DateTime? @db.Timestamptz(6)
+  last_active_at DateTime? @db.Timestamptz(6)
+  created_at     DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@unique([user_id, tenant_id])
+  @@map("tenant_memberships")
+}
+
+model RefreshToken {
+  id              String    @id @default(uuid()) @db.Uuid
+  user_id         String    @db.Uuid
+  membership_id   String?   @db.Uuid
+  token_hash      String    @unique
+  family_id       String    @db.Uuid
+  revoked_at      DateTime? @db.Timestamptz(6)
+  replaced_by_id  String?   @db.Uuid
+  user_agent      String?
+  ip_address      String?
+  expires_at      DateTime  @db.Timestamptz(6)
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("refresh_tokens")
+}
+
+// ───────────────────────────── RBAC + ABAC ─────────────────────────────
+
+model Role {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String?  @db.Uuid
+  name       String
+  color      String?
+  is_system  Boolean  @default(false)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([tenant_id, name])
+  @@map("roles")
+}
+
+model RolePermission {
+  role_id    String @db.Uuid
+  permission String
+
+  @@id([role_id, permission])
+  @@map("role_permissions")
+}
+
+model HierarchyUnit {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  parent_id  String?  @db.Uuid
+  name       String
+  type       String
+  code       String?
+  address    String?
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("hierarchy_units")
+}
+
+model HierarchyClosure {
+  ancestor_id   String @db.Uuid
+  descendant_id String @db.Uuid
+  depth         Int
+
+  @@id([ancestor_id, descendant_id])
+  @@map("hierarchy_closure")
+}
+
+// ───────────────────────────── People ─────────────────────────────
+
+model Household {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenant_id      String   @db.Uuid
+  name           String
+  head_member_id String?  @db.Uuid
+  address_line1  String?
+  address_line2  String?
+  city           String?
+  state          String?
+  country        String?
+  postal_code    String?
+  total_giving   Decimal  @default(0) @db.Decimal(12, 2)
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("households")
+}
+
+model Member {
+  id                         String    @id @default(uuid()) @db.Uuid
+  tenant_id                  String    @db.Uuid
+  user_id                    String?   @db.Uuid
+  household_id               String?   @db.Uuid
+  first_name                 String
+  last_name                  String
+  preferred_name             String?
+  photo_url                  String?
+  email                      String?   @db.Citext
+  phone                      String?
+  whatsapp                   String?
+  status                     String    @default("active")
+  envelope_number            String?
+  unit_id                    String?   @db.Uuid
+  joined_at                  DateTime? @db.Date
+  last_seen_at               DateTime? @db.Date
+  date_of_birth              DateTime? @db.Date
+  gender                     String?
+  marital_status             String?
+  occupation                 String?
+  address_line1              String?
+  address_line2              String?
+  city                       String?
+  state                      String?
+  country                    String?
+  postal_code                String?
+  transferred_to_member_id   String?   @db.Uuid
+  transferred_from_member_id String?   @db.Uuid
+  created_at                 DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at                 DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@map("members")
+}
+
+model SacramentalRecord {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenant_id      String   @db.Uuid
+  member_id      String   @db.Uuid
+  type           String
+  date           DateTime @db.Date
+  officiant_name String?
+  location       String?
+  notes          String?
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("sacramental_records")
+}
+
+model PastoralNote {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenant_id      String   @db.Uuid
+  member_id      String   @db.Uuid
+  content        String
+  author_user_id String   @db.Uuid
+  is_private     Boolean  @default(true)
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("pastoral_notes")
+}
+
+model MemberTransfer {
+  id                   String    @id @default(uuid()) @db.Uuid
+  from_tenant_id       String    @db.Uuid
+  to_tenant_id         String    @db.Uuid
+  from_member_id       String    @db.Uuid
+  to_member_id         String?   @db.Uuid
+  requested_by_user_id String    @db.Uuid
+  approved_by_user_id  String?   @db.Uuid
+  status               String    @default("pending")
+  history_scope        String    @default("identity_only")
+  certificate_id       String?   @db.Uuid
+  notes                String?
+  requested_at         DateTime  @default(now()) @db.Timestamptz(6)
+  decided_at           DateTime? @db.Timestamptz(6)
+  completed_at         DateTime? @db.Timestamptz(6)
+
+  @@map("member_transfers")
+}
+
+// ───────────────────────────── Activity ─────────────────────────────
+
+model Event {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  title              String
+  type               String
+  description        String?
+  location           String?
+  start_date_time    DateTime  @db.Timestamptz(6)
+  end_date_time      DateTime? @db.Timestamptz(6)
+  is_recurring       Boolean   @default(false)
+  recurrence_rule    String?
+  status             String    @default("draft")
+  unit_id            String?   @db.Uuid
+  attendance_mode    String    @default("individual")
+  is_public          Boolean   @default(false)
+  created_by_user_id String    @db.Uuid
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@map("events")
+}
+
+model AttendanceRecord {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenant_id         String   @db.Uuid
+  event_id          String   @db.Uuid
+  mode              String
+  member_id         String?  @db.Uuid
+  adult_count       Int?
+  child_count       Int?
+  total_count       Int?
+  marked_at         DateTime @default(now()) @db.Timestamptz(6)
+  marked_by_user_id String   @db.Uuid
+
+  // Postgres unique constraints treat NULL as distinct, so headcount rows
+  // (member_id = null) never collide with each other under this index —
+  // no partial index needed to get "one row per member per event."
+  @@unique([event_id, member_id])
+  @@map("attendance_records")
+}
+
+// ───────────────────────────── Finance ─────────────────────────────
+
+model Fund {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenant_id      String   @db.Uuid
+  name           String
+  description    String?
+  is_default     Boolean  @default(false)
+  target         Decimal? @db.Decimal(12, 2)
+  total_received Decimal  @default(0) @db.Decimal(12, 2)
+  is_active      Boolean  @default(true)
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("funds")
+}
+
+model DonationBatch {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  name               String
+  description        String?
+  service_id         String?   @db.Uuid
+  date               DateTime  @db.Date
+  status             String    @default("open")
+  verified_total     Decimal?  @db.Decimal(12, 2)
+  created_by_user_id String    @db.Uuid
+  closed_at          DateTime? @db.Timestamptz(6)
+  posted_at          DateTime? @db.Timestamptz(6)
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("donation_batches")
+}
+
+model Donation {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  batch_id           String    @db.Uuid
+  member_id          String?   @db.Uuid
+  is_guest           Boolean   @default(false)
+  guest_name         String?
+  envelope_number    String?
+  fund_id            String    @db.Uuid
+  amount             Decimal   @db.Decimal(12, 2)
+  payment_method     String
+  notes              String?
+  reference_number   String?
+  is_voided          Boolean   @default(false)
+  voided_at          DateTime? @db.Timestamptz(6)
+  void_reason        String?
+  voided_by_user_id  String?   @db.Uuid
+  created_by_user_id String    @db.Uuid
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("donations")
+}
+
+model Pledge {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenant_id        String   @db.Uuid
+  member_id        String   @db.Uuid
+  fund_id          String   @db.Uuid
+  pledge_amount    Decimal  @db.Decimal(12, 2)
+  amount_fulfilled Decimal  @default(0) @db.Decimal(12, 2)
+  start_date       DateTime @db.Date
+  end_date         DateTime @db.Date
+  frequency        String?
+  status           String   @default("active")
+  created_at       DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("pledges")
+}
+
+// ───────────────────────────── Comms ─────────────────────────────
+
+model Announcement {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenant_id       String    @db.Uuid
+  title           String
+  body            String
+  is_pinned       Boolean   @default(false)
+  status          String    @default("draft")
+  channels        String[]
+  audience_filter Json?
+  scheduled_at    DateTime? @db.Timestamptz(6)
+  sent_at         DateTime? @db.Timestamptz(6)
+  author_user_id  String    @db.Uuid
+  sent_count      Int?
+  delivered_count Int?
+  opened_count    Int?
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@map("announcements")
+}
+
+model MessageTemplate {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  name       String
+  subject    String?
+  body       String
+  category   String?
+  is_active  Boolean  @default(true)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("message_templates")
+}
+
+model Notification {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  user_id    String   @db.Uuid
+  type       String
+  title      String
+  body       String
+  is_read    Boolean  @default(false)
+  action_url String?
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("notifications")
+}
+
+// ───────────────────────────── Certificates ─────────────────────────────
+
+model CertificateTemplate {
+  id                   String   @id @default(uuid()) @db.Uuid
+  tenant_id            String   @db.Uuid
+  name                 String
+  category             String
+  status               String   @default("draft")
+  background_image_url String?
+  tokens               Json     @default("[]")
+  qr_code_position     Json?
+  created_at           DateTime @default(now()) @db.Timestamptz(6)
+  updated_at           DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("certificate_templates")
+}
+
+model Certificate {
+  id                String    @id @default(uuid()) @db.Uuid
+  tenant_id         String    @db.Uuid
+  template_id       String    @db.Uuid
+  member_id         String    @db.Uuid
+  issued_by_user_id String    @db.Uuid
+  issued_at         DateTime  @default(now()) @db.Timestamptz(6)
+  serial_number     String
+  qr_hash           String    @unique
+  custom_values     Json      @default("{}")
+  is_revoked        Boolean   @default(false)
+  revoked_at        DateTime? @db.Timestamptz(6)
+  revoked_reason    String?
+  pdf_url           String?
+
+  @@unique([tenant_id, serial_number])
+  @@map("certificates")
+}
+
+// ───────────────────────────── Media ─────────────────────────────
+
+model MediaAsset {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenant_id           String   @db.Uuid
+  uploaded_by_user_id String   @db.Uuid
+  kind                String
+  storage_key         String
+  url                 String
+  mime_type           String
+  size_bytes          BigInt
+  width               Int?
+  height              Int?
+  alt_text            String?
+  created_at          DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("media_assets")
+}
+
+model MediaAttachment {
+  media_id        String @db.Uuid
+  attachable_type String
+  attachable_id   String @db.Uuid
+  role            String @default("primary")
+  position        Int    @default(0)
+
+  @@id([media_id, attachable_type, attachable_id, role])
+  @@map("media_attachments")
+}
+
+// ───────────────────────────── Audit ─────────────────────────────
+
+model AuditLog {
+  id                      String   @id @default(uuid()) @db.Uuid
+  tenant_id               String?  @db.Uuid
+  actor_user_id           String?  @db.Uuid
+  action                  String
+  resource_type           String
+  resource_id             String?  @db.Uuid
+  metadata                Json?
+  ip_address              String?  @db.Inet
+  is_impersonated         Boolean  @default(false)
+  impersonated_by_user_id String?  @db.Uuid
+  created_at              DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("audit_logs")
+}

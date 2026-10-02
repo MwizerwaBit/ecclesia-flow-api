@@ -1,37 +1,32 @@
-import uuid
-from datetime import UTC, datetime
-
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.modules.audit.models import AuditLog
+from prisma import Json, Prisma
 
 
 async def write_audit(
-    db: AsyncSession,
+    db: Prisma,
     *,
-    tenant_id: uuid.UUID | None,
-    actor_user_id: uuid.UUID | None,
+    tenant_id: str | None,
+    actor_user_id: str | None,
     action: str,
     resource_type: str,
-    resource_id: uuid.UUID | None = None,
+    resource_id: str | None = None,
     metadata: dict | None = None,
     ip_address: str | None = None,
     is_impersonated: bool = False,
-    impersonated_by_user_id: uuid.UUID | None = None,
+    impersonated_by_user_id: str | None = None,
 ) -> None:
-    db.add(
-        AuditLog(
-            id=uuid.uuid4(),
-            tenant_id=tenant_id,
-            actor_user_id=actor_user_id,
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            audit_metadata=metadata,
-            ip_address=ip_address,
-            is_impersonated=is_impersonated,
-            impersonated_by_user_id=impersonated_by_user_id,
-            created_at=datetime.now(UTC),
-        )
-    )
-    await db.flush()
+    data = {
+        "tenant_id": tenant_id,
+        "actor_user_id": actor_user_id,
+        "action": action,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "ip_address": ip_address,
+        "is_impersonated": is_impersonated,
+        "impersonated_by_user_id": impersonated_by_user_id,
+    }
+    # Prisma's nullable-Json input type wants the key OMITTED for "no value,"
+    # not present-and-None — passing `"metadata": None` explicitly raises
+    # MissingRequiredValueError even though the column itself is nullable.
+    if metadata is not None:
+        data["metadata"] = Json(metadata)
+    await db.auditlog.create(data=data)

@@ -85,7 +85,7 @@ async def switch_tenant(request: Request, payload: SwitchTenantRequest, claims: 
     return await service.switch_tenant(
         db,
         user_id=claims.sub,
-        membership_id=payload.membership_id,
+        membership_id=str(payload.membership_id),
         user_agent=request.headers.get("user-agent"),
         ip_address=_client_ip(request),
     )

@@ -1,11 +1,9 @@
 import re
-import uuid
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from prisma import Prisma
+from prisma.models import Organization
 
 from app.modules.tenant import repository
-from app.modules.tenant.models import Organization
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -15,7 +13,7 @@ def slugify(name: str) -> str:
     return base or "church"
 
 
-async def unique_slug(db: AsyncSession, name: str) -> str:
+async def unique_slug(db: Prisma, name: str) -> str:
     base = slugify(name)
     candidate = base
     suffix = 1
@@ -26,14 +24,14 @@ async def unique_slug(db: AsyncSession, name: str) -> str:
 
 
 async def create_organization_with_root_unit(
-    db: AsyncSession,
+    db: Prisma,
     *,
     legal_name: str,
     display_name: str,
     country: str,
     currency: str,
     timezone_name: str,
-) -> tuple[Organization, uuid.UUID]:
+) -> tuple[Organization, str]:
     """Creates the organization AND its root hierarchy unit in one
     transaction. ``app.tenant_id`` is set manually the instant the new org's
     id exists, so the hierarchy_units insert (NOT NULL tenant_id, RLS-bound)
@@ -50,14 +48,9 @@ async def create_organization_with_root_unit(
         currency=currency,
         timezone_name=timezone_name,
     )
-    await db.execute(text("select set_config('app.tenant_id', :v, true)"), {"v": str(org.id)})
+    await db.execute_raw("select set_config('app.tenant_id', $1, true)", org.id)
 
-    root_unit_id = uuid.uuid4()
-    await db.execute(
-        text(
-            "insert into hierarchy_units (id, tenant_id, parent_id, name, type, created_at) "
-            "values (:id, :tenant_id, null, :name, 'Church', now())"
-        ),
-        {"id": str(root_unit_id), "tenant_id": str(org.id), "name": display_name},
+    root_unit = await db.hierarchyunit.create(
+        data={"tenant_id": org.id, "parent_id": None, "name": display_name, "type": "Church"}
     )
-    return org, root_unit_id
+    return org, root_unit.id

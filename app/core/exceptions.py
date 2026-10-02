@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import SQLAlchemyError
+from prisma.errors import PrismaError, RecordNotFoundError, UniqueViolationError
 
 logger = logging.getLogger("ecclesia_flow")
 
@@ -85,8 +85,24 @@ def register_exception_handlers(app: FastAPI) -> None:
             | {"fields": jsonable_encoder(exc.errors())},
         )
 
-    @app.exception_handler(SQLAlchemyError)
-    async def handle_db_error(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+    @app.exception_handler(UniqueViolationError)
+    async def handle_unique_violation(request: Request, exc: UniqueViolationError) -> JSONResponse:
+        request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=_error_body("conflict", "A record with this value already exists.", request_id),
+        )
+
+    @app.exception_handler(RecordNotFoundError)
+    async def handle_record_not_found(request: Request, exc: RecordNotFoundError) -> JSONResponse:
+        request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=_error_body("not_found", "The requested resource does not exist.", request_id),
+        )
+
+    @app.exception_handler(PrismaError)
+    async def handle_db_error(request: Request, exc: PrismaError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
         logger.error("db_error request_id=%s", request_id, exc_info=exc)
         return JSONResponse(

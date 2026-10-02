@@ -1,102 +1,103 @@
-"""Database engines and the tenant-scoped session dependency.
+"""Prisma clients and the tenant-scoped transaction helper.
 
-Two request-serving roles, matching the two frontend access paths
-(docs/database-design.md §8.2):
+Two long-lived, request-serving clients, matching the two frontend access
+paths (docs/database-design.md §8.2):
 
-- ``app_tenant`` — every ordinary request. RLS applies in full; the session
-  variable ``app.tenant_id`` (and ``app.user_id``, for the self-visibility
-  carve-out on ``tenant_memberships``) is set from the *signed JWT*, never
-  from a client-supplied header or body field.
-- ``app_platform`` — the platform-admin service only. BYPASSRLS. Every
-  dependency that hands out this session also requires
-  ``require_platform_admin`` upstream and the caller is responsible for an
-  explicit ``audit_logs`` write.
+- ``tenant_client`` — every ordinary request, connected as ``app_tenant``.
+  RLS applies in full; the session variable ``app.tenant_id`` (and
+  ``app.user_id``, for the self-visibility carve-out on
+  ``tenant_memberships``) is set from the *signed JWT*, never from a
+  client-supplied header or body field.
+- ``platform_client`` — the platform-admin service only, connected as
+  ``app_platform``. BYPASSRLS. Every dependency that hands out a transaction
+  on this client also requires ``require_platform_admin`` upstream, and the
+  caller is responsible for an explicit ``audit_logs`` write.
 
-A third, superuser-ish engine (``admin``) exists only for Alembic and the
-seed script — it is never wired into a FastAPI dependency.
+Both are plain ``Prisma()`` instances pointed at a non-default datasource
+URL and connected once at process startup (see ``app/main.py``'s lifespan).
+A transaction (``client.tx()``) is Prisma's unit that can mix raw SQL
+(``set_config``) and generated-model queries (``tx.user.find_many(...)``)
+against the SAME underlying connection — the equivalent of the SQLAlchemy
+``AsyncSession`` this module used to wrap.
 """
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from prisma import Prisma
 
 from app.core.config import get_settings
 
-
-def _make_engine(url: str) -> AsyncEngine:
-    return create_async_engine(url, pool_pre_ping=True, pool_size=10, max_overflow=10)
-
-
 _settings = get_settings()
-tenant_engine = _make_engine(_settings.database_url_app)
-platform_engine = _make_engine(_settings.database_url_platform)
-admin_engine = _make_engine(_settings.database_url)
 
-TenantSessionLocal = async_sessionmaker(tenant_engine, expire_on_commit=False)
-PlatformSessionLocal = async_sessionmaker(platform_engine, expire_on_commit=False)
-AdminSessionLocal = async_sessionmaker(admin_engine, expire_on_commit=False)
+tenant_client = Prisma(datasource={"url": _settings.database_url_app})
+platform_client = Prisma(datasource={"url": _settings.database_url_platform})
 
 
-async def get_admin_db() -> AsyncGenerator[AsyncSession, None]:
-    """Superuser session — migrations/seed scripts ONLY, never a FastAPI route."""
-    async with AdminSessionLocal() as session:
-        yield session
+async def connect_clients() -> None:
+    await tenant_client.connect()
+    await platform_client.connect()
+
+
+async def disconnect_clients() -> None:
+    if tenant_client.is_connected():
+        await tenant_client.disconnect()
+    if platform_client.is_connected():
+        await platform_client.disconnect()
 
 
 @asynccontextmanager
-async def tenant_session(tenant_id: str, user_id: str | None = None) -> AsyncGenerator[AsyncSession, None]:
+async def tenant_session(tenant_id: str, user_id: str | None = None) -> AsyncGenerator[Prisma, None]:
     """Open a transaction on the ``app_tenant`` role with ``app.tenant_id``
     (and optionally ``app.user_id``) pinned for that transaction only.
 
     ``set_config(..., true)`` scopes to the current transaction, so a pooled
     connection can never leak one request's tenant context into the next —
-    this is the one invariant the whole isolation model rests on.
+    this is the one invariant the whole isolation model rests on. (It does
+    NOT reset to NULL afterward, only to an empty string — see
+    docs/SECURITY_NOTES.md §1 for why every RLS policy guards against that
+    with ``current_tenant_id()``/``current_app_user_id()`` instead of a raw
+    cast.)
     """
-    async with TenantSessionLocal() as session:
-        async with session.begin():
-            await session.execute(text("select set_config('app.tenant_id', :v, true)"), {"v": tenant_id})
-            if user_id:
-                await session.execute(text("select set_config('app.user_id', :v, true)"), {"v": user_id})
-            yield session
+    async with tenant_client.tx() as tx:
+        await tx.execute_raw("select set_config('app.tenant_id', $1, true)", tenant_id)
+        if user_id:
+            await tx.execute_raw("select set_config('app.user_id', $1, true)", user_id)
+        yield tx
 
 
 @asynccontextmanager
-async def platform_session() -> AsyncGenerator[AsyncSession, None]:
-    async with PlatformSessionLocal() as session:
-        async with session.begin():
-            yield session
+async def platform_session() -> AsyncGenerator[Prisma, None]:
+    async with platform_client.tx() as tx:
+        yield tx
 
 
 @asynccontextmanager
-async def self_scoped_session(user_id: str) -> AsyncGenerator[AsyncSession, None]:
+async def self_scoped_session(user_id: str) -> AsyncGenerator[Prisma, None]:
     """``app.user_id`` set, ``app.tenant_id`` deliberately left unset.
 
     For the one query that's legitimately cross-tenant for an ordinary user:
     "which churches do I belong to" (login, and the tenant-switcher). The
     ``tenant_memberships`` RLS policy's self-visibility clause
-    (``user_id = current_setting('app.user_id')``) is what makes this safe —
-    every OTHER tenant-scoped table still filters to nothing, since
+    (``user_id = current_app_user_id()``) is what makes this safe — every
+    OTHER tenant-scoped table still filters to nothing, since
     ``app.tenant_id`` is unset.
     """
-    async with TenantSessionLocal() as session:
-        async with session.begin():
-            await session.execute(text("select set_config('app.user_id', :v, true)"), {"v": user_id})
-            yield session
+    async with tenant_client.tx() as tx:
+        await tx.execute_raw("select set_config('app.user_id', $1, true)", user_id)
+        yield tx
 
 
 @asynccontextmanager
-async def unscoped_tenant_session() -> AsyncGenerator[AsyncSession, None]:
-    """``app_tenant`` role but with NO ``app.tenant_id`` set.
+async def unscoped_tenant_session() -> AsyncGenerator[Prisma, None]:
+    """``app_tenant`` role but with NO ``app.tenant_id``/``app.user_id`` set.
 
-    RLS policies compare against ``current_setting('app.tenant_id', true)``
-    with the ``true`` "missing_ok" flag, so an unset variable means every
-    tenant-scoped row is filtered out (the policy's equality check becomes
-    ``tenant_id = NULL`` which matches nothing) — safe-by-default for the one
-    legitimate pre-tenant-context use case: creating a brand new organization
-    during registration, where ``app.tenant_id`` is set manually mid-transaction
-    the moment the new org's id exists (see modules/tenant/service.py).
+    RLS policies compare against ``current_tenant_id()``, which is NULL when
+    unset, so every tenant-scoped row is filtered out — safe-by-default for
+    the one legitimate pre-tenant-context use case: creating a brand new
+    organization during registration. ``organizations`` itself carries no
+    tenant_id and isn't RLS-protected, so the insert succeeds; the
+    hierarchy_units insert that follows it switches this same transaction to
+    the new tenant's context first (see modules/tenant/service.py).
     """
-    async with TenantSessionLocal() as session:
-        async with session.begin():
-            yield session
+    async with tenant_client.tx() as tx:
+        yield tx

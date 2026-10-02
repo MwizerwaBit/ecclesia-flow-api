@@ -1,12 +1,10 @@
-import uuid
-
-from sqlalchemy.ext.asyncio import AsyncSession
+from prisma import Prisma
 
 from app.modules.rbac import repository
 from app.modules.rbac.models import SYSTEM_ROLE_PERMISSIONS
 
 
-async def resolve_permissions(db: AsyncSession, role_id: uuid.UUID) -> list[str]:
+async def resolve_permissions(db: Prisma, role_id: str) -> list[str]:
     """A custom role's own checklist REPLACES the system default entirely —
     mirrors useRole.ts's `user?.permissions ?? ROLE_PERMISSIONS[role]` exactly
     (a custom role is a different, explicit list, never a merge)."""
