@@ -113,6 +113,29 @@ repository layer:
   convert with `str(...)` at the router before handing it to a service/
   repository function.
 
+## 6. A second `prisma migrate dev --create-only` tries to drop every hand-written FK/index
+
+Because `schema.prisma` is deliberately relation-free (see its header comment),
+Prisma's diff engine only knows about the columns it generated `CREATE TABLE`
+for — it has no model of the foreign keys, RLS policies, or extra indexes
+hand-appended to `migration.sql` after the fact. The first migration's own
+diff never saw this (nothing to compare against yet), but generating a
+**second** migration diffs the live database against "what schema.prisma
+would produce from scratch," and every hand-written constraint from migration
+1 shows up as unexpected drift — Prisma emitted a migration that opened with
+60+ `DROP CONSTRAINT`/`DROP INDEX` statements for completely unrelated,
+already-working tables. Applying that as generated would have silently torn
+down every foreign key and RLS policy in the database.
+
+**Rule for every future migration on this schema:** after
+`prisma migrate dev --create-only`, read the generated SQL before touching
+anything else. Delete any `DropForeignKey`/`DropIndex`/`DropTable` block that
+isn't actually about the table(s) you meant to change, keep only the genuine
+`CreateTable`/`CreateIndex` statements, then hand-append the new FKs/RLS/
+checks the same way migration 0002 (`…_add_rbac_and_platform_tables`) does.
+Never run the raw generated file through `migrate dev`/`migrate deploy`
+without reading it first on this project.
+
 ## Known, deliberately deferred
 
 - **MFA challenge tokens are not single-use.** A `challenge_token` (issued after

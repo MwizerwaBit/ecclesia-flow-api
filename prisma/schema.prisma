@@ -37,7 +37,7 @@ model Organization {
   currency        String    @db.Char(3)
   timezone        String
   language        String    @default("en")
-  status          String    @default("trial")
+  status          String    @default("pending")
   tier            String    @default("seed")
   logo_url        String?
   primary_color   String?
@@ -45,6 +45,18 @@ model Organization {
   trial_ends_at   DateTime? @db.Timestamptz(6)
   renewal_date    DateTime? @db.Timestamptz(6)
   storage_used_mb Int       @default(0)
+  verification_status String    @default("unverified")
+  registration_number String?
+  denomination        String?
+  contact_email       String?
+  contact_phone       String?
+  address_line1       String?
+  city                String?
+  region              String?
+  website             String?
+  activated_at        DateTime? @db.Timestamptz(6)
+  activation_source   String?
+  activation_note     String?
   created_at      DateTime  @default(now()) @db.Timestamptz(6)
   updated_at      DateTime  @updatedAt @db.Timestamptz(6)
 
@@ -64,6 +76,10 @@ model User {
   mfa_secret           String?
   mfa_backup_codes     String[]
   status               String    @default("active")
+  failed_login_count   Int       @default(0)
+  last_failed_login_at DateTime? @db.Timestamptz(6)
+  locked_until         DateTime? @db.Timestamptz(6)
+  password_changed_at  DateTime? @db.Timestamptz(6)
   created_at           DateTime  @default(now()) @db.Timestamptz(6)
   last_login_at        DateTime? @db.Timestamptz(6)
 
@@ -82,6 +98,8 @@ model TenantMembership {
   invited_at     DateTime? @db.Timestamptz(6)
   accepted_at    DateTime? @db.Timestamptz(6)
   last_active_at DateTime? @db.Timestamptz(6)
+  invite_token_hash String?  @unique
+  invite_expires_at DateTime? @db.Timestamptz(6)
   created_at     DateTime  @default(now()) @db.Timestamptz(6)
 
   @@unique([user_id, tenant_id])
@@ -98,10 +116,24 @@ model RefreshToken {
   replaced_by_id  String?   @db.Uuid
   user_agent      String?
   ip_address      String?
+  mfa_verified    Boolean   @default(false)
   expires_at      DateTime  @db.Timestamptz(6)
   created_at      DateTime  @default(now()) @db.Timestamptz(6)
 
   @@map("refresh_tokens")
+}
+
+// Only the SHA-256 of a reset token is stored; the token exists only in the email.
+model PasswordResetToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  user_id      String    @db.Uuid
+  token_hash   String    @unique
+  expires_at   DateTime  @db.Timestamptz(6)
+  used_at      DateTime? @db.Timestamptz(6)
+  requested_ip String?
+  created_at   DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("password_reset_tokens")
 }
 
 // ───────────────────────────── RBAC + ABAC ─────────────────────────────
@@ -134,9 +166,27 @@ model HierarchyUnit {
   type       String
   code       String?
   address    String?
+  unit_type_id String? @db.Uuid
   created_at DateTime @default(now()) @db.Timestamptz(6)
 
   @@map("hierarchy_units")
+}
+
+// A church's own names for its levels, and which level may sit under which
+// (migration 20261009090000). Opt-in: with none defined, unit types are free text.
+model UnitType {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenant_id           String   @db.Uuid
+  key                 String
+  label               String
+  plural_label        String
+  allowed_parent_keys String[]
+  can_be_root         Boolean  @default(false)
+  sort_order          Int      @default(0)
+  created_at          DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([tenant_id, key])
+  @@map("unit_types")
 }
 
 model HierarchyClosure {
@@ -196,10 +246,93 @@ model Member {
   postal_code                String?
   transferred_to_member_id   String?   @db.Uuid
   transferred_from_member_id String?   @db.Uuid
+  // Registration (migration 20261004090000)
+  title                          String?
+  middle_name                    String?
+  employer                       String?
+  preferred_contact              String?
+  join_method                    String?
+  previous_church                String?
+  invited_by                     String?
+  is_baptised                    Boolean?
+  baptism_date                   DateTime? @db.Date
+  household_role                 String?
+  emergency_contact_name         String?
+  emergency_contact_phone        String?
+  emergency_contact_relationship String?
+  consent_data_processing_at     DateTime? @db.Timestamptz(6)
+  consent_given_by               String?
+  consent_communications         Boolean   @default(false)
+  directory_visible              Boolean   @default(true)
+  notes                          String?
+  id_type                        String?
+  national_id_hash               String?
+  national_id_encrypted          String?
+  national_id_last4              String?
   created_at                 DateTime  @default(now()) @db.Timestamptz(6)
   updated_at                 DateTime  @updatedAt @db.Timestamptz(6)
 
   @@map("members")
+}
+
+// A person's home unit (exactly one while current — mirrored in
+// members.unit_id) and any associate units, with history.
+model UnitMembership {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  member_id          String    @db.Uuid
+  unit_id            String    @db.Uuid
+  kind               String    @default("home")
+  status             String    @default("active")
+  started_on         DateTime  @default(now()) @db.Date
+  ended_on           DateTime? @db.Date
+  end_reason         String?
+  created_by_user_id String?   @db.Uuid
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("unit_memberships")
+}
+
+// Ministries, small groups, choirs, teams. Not hierarchy units: a person has
+// one unit but any number of groups, with a role in each.
+model Group {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenant_id         String   @db.Uuid
+  name              String
+  type              String   @default("ministry")
+  description       String?
+  unit_id           String?  @db.Uuid
+  meeting_frequency String   @default("weekly")
+  meeting_day       String?
+  meeting_time      String?
+  meeting_location  String?
+  is_open           Boolean  @default(true)
+  capacity          Int?
+  color             String   @default("#4f46e5")
+  is_archived       Boolean  @default(false)
+  created_at        DateTime @default(now()) @db.Timestamptz(6)
+  updated_at        DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("groups")
+}
+
+model GroupMembership {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  group_id   String   @db.Uuid
+  member_id  String   @db.Uuid
+  role       String   @default("member")
+  note       String?
+  status             String    @default("active")
+  invited_by_user_id String?   @db.Uuid
+  invited_at         DateTime? @db.Timestamptz(6)
+  responded_at       DateTime? @db.Timestamptz(6)
+  joined_at  DateTime @default(now()) @db.Date
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([group_id, member_id])
+  @@map("group_memberships")
 }
 
 model SacramentalRecord {
@@ -265,6 +398,14 @@ model Event {
   unit_id            String?   @db.Uuid
   attendance_mode    String    @default("individual")
   is_public          Boolean   @default(false)
+  visibility         String    @default("members")
+  group_id           String?   @db.Uuid
+  cover_image_url    String?
+  theme              Json      @default("{}")
+  online_url         String?
+  capacity           Int?
+  submitted_at       DateTime? @db.Timestamptz(6)
+  published_at       DateTime? @db.Timestamptz(6)
   created_by_user_id String    @db.Uuid
   created_at         DateTime  @default(now()) @db.Timestamptz(6)
   updated_at         DateTime  @updatedAt @db.Timestamptz(6)
@@ -315,6 +456,8 @@ model DonationBatch {
   service_id         String?   @db.Uuid
   date               DateTime  @db.Date
   status             String    @default("open")
+  total_amount       Decimal   @default(0) @db.Decimal(12, 2)
+  donation_count     Int       @default(0)
   verified_total     Decimal?  @db.Decimal(12, 2)
   created_by_user_id String    @db.Uuid
   closed_at          DateTime? @db.Timestamptz(6)
@@ -494,6 +637,289 @@ model AuditLog {
   is_impersonated         Boolean  @default(false)
   impersonated_by_user_id String?  @db.Uuid
   created_at              DateTime @default(now()) @db.Timestamptz(6)
+  // Hash chain (migration 20261009120000) — filled by a trigger, never by the app.
+  chain_seq               BigInt?
+  prev_hash               String?
+  row_hash                String?
 
   @@map("audit_logs")
+}
+
+// ───────────────────────────── Team / leadership ─────────────────────────────
+
+model LeadershipTransfer {
+  id                           String    @id @default(uuid()) @db.Uuid
+  tenant_id                    String    @db.Uuid
+  outgoing_leader_membership_id String   @db.Uuid
+  nominee_membership_id        String    @db.Uuid
+  initiated_by_membership_id   String    @db.Uuid
+  initiated_at                 DateTime  @default(now()) @db.Timestamptz(6)
+  mfa_verified_at              DateTime  @db.Timestamptz(6)
+  required_approvals           Int       @default(2)
+  eligible_approver_ids        String[]  @db.Uuid
+  // Array of {membership_id, name, approved_at} — small, write-mostly,
+  // never queried independently of its parent request, so a join table
+  // would be pure overhead here (same reasoning as certificate_templates.tokens).
+  approvals                    Json      @default("[]")
+  status                       String    @default("pending_approvals")
+  completed_at                 DateTime? @db.Timestamptz(6)
+  canceled_at                  DateTime? @db.Timestamptz(6)
+
+  @@map("leadership_transfers")
+}
+
+// ───────────────────────────── Notification preferences ─────────────────────────────
+
+model NotificationPreference {
+  user_id     String @id @db.Uuid
+  // {[NotificationType]: {[NotificationChannel]: boolean}} — same
+  // small-and-wholly-owned-by-one-row reasoning as above.
+  preferences Json   @default("{}")
+
+  @@map("notification_preferences")
+}
+
+// ───────────────────────────── Platform admin ─────────────────────────────
+
+model FeatureFlagOverride {
+  id                String    @id @default(uuid()) @db.Uuid
+  tenant_id         String    @db.Uuid
+  feature_code      String
+  is_enabled        Boolean
+  overridden_by_user_id String @db.Uuid
+  overridden_at     DateTime  @default(now()) @db.Timestamptz(6)
+  override_expires_at DateTime? @db.Timestamptz(6)
+  override_note     String?
+
+  @@unique([tenant_id, feature_code])
+  @@map("feature_flag_overrides")
+}
+
+model CustomDomain {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenant_id        String    @db.Uuid
+  domain           String    @unique
+  status           String    @default("pending_verification")
+  ssl_provisioned  Boolean   @default(false)
+  verified_at      DateTime? @db.Timestamptz(6)
+  created_at       DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("custom_domains")
+}
+
+model DataErasureRequest {
+  id                   String    @id @default(uuid()) @db.Uuid
+  tenant_id            String    @db.Uuid
+  member_id            String    @db.Uuid
+  requested_by_user_id String    @db.Uuid
+  requested_at         DateTime  @default(now()) @db.Timestamptz(6)
+  status               String    @default("pending")
+  completed_at         DateTime? @db.Timestamptz(6)
+  processed_by_user_id String?   @db.Uuid
+  notes                String?
+
+  @@map("data_erasure_requests")
+}
+
+model ImpersonationSession {
+  id                   String    @id @default(uuid()) @db.Uuid
+  platform_admin_user_id String  @db.Uuid
+  tenant_id            String    @db.Uuid
+  impersonated_role    String
+  started_at           DateTime  @default(now()) @db.Timestamptz(6)
+  expires_at           DateTime  @db.Timestamptz(6)
+  ended_at             DateTime? @db.Timestamptz(6)
+
+  @@map("impersonation_sessions")
+}
+
+
+// ───────────────────────────── Organisation lifecycle ─────────────────────────────
+
+model OrgDocument {
+  id                  String    @id @default(uuid()) @db.Uuid
+  tenant_id           String    @db.Uuid
+  kind                String    @default("government_certificate")
+  file_name           String
+  mime_type           String
+  size_bytes          Int
+  sha256              String
+  storage_key         String
+  status              String    @default("pending_review")
+  uploaded_by_user_id String    @db.Uuid
+  uploaded_at         DateTime  @default(now()) @db.Timestamptz(6)
+  reviewed_by_user_id String?   @db.Uuid
+  reviewed_at         DateTime? @db.Timestamptz(6)
+  review_note         String?
+
+  @@map("org_documents")
+}
+
+model OrgModuleOverride {
+  tenant_id       String   @db.Uuid
+  module_id       String
+  enabled         Boolean
+  set_by_user_id  String   @db.Uuid
+  set_by_platform Boolean  @default(false)
+  updated_at      DateTime @default(now()) @db.Timestamptz(6)
+
+  @@id([tenant_id, module_id])
+  @@map("org_module_overrides")
+}
+
+// ───────────────────────────── Billing ─────────────────────────────
+
+model BillingSubscription {
+  id                       String    @id @default(uuid()) @db.Uuid
+  tenant_id                String    @unique @db.Uuid
+  provider                 String
+  tier                     String
+  interval                 String
+  status                   String    @default("incomplete")
+  provider_customer_id     String?
+  provider_subscription_id String?
+  current_period_end       DateTime? @db.Timestamptz(6)
+  created_at               DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at               DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("billing_subscriptions")
+}
+
+model BillingCheckoutSession {
+  id                  String    @id @default(uuid()) @db.Uuid
+  tenant_id           String    @db.Uuid
+  provider            String
+  provider_session_id String
+  tier                String
+  interval            String
+  amount_cents        Int
+  currency            String
+  status              String    @default("open")
+  created_by_user_id  String    @db.Uuid
+  created_at          DateTime  @default(now()) @db.Timestamptz(6)
+  completed_at        DateTime? @db.Timestamptz(6)
+
+  @@unique([provider, provider_session_id])
+  @@map("billing_checkout_sessions")
+}
+
+model BillingPayment {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  provider           String
+  provider_reference String
+  amount_cents       Int
+  currency           String
+  status             String
+  description        String?
+  paid_at            DateTime? @db.Timestamptz(6)
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@unique([provider, provider_reference])
+  @@map("billing_payments")
+}
+
+model BillingWebhookEvent {
+  id                String    @id @default(uuid()) @db.Uuid
+  provider          String
+  provider_event_id String
+  type              String
+  tenant_id         String?   @db.Uuid
+  payload           Json
+  processed_at      DateTime? @db.Timestamptz(6)
+  created_at        DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@unique([provider, provider_event_id])
+  @@map("billing_webhook_events")
+}
+
+// ───────────────────────────── Leadership ─────────────────────────────
+
+model LeadershipPosition {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenant_id   String   @db.Uuid
+  parent_id   String?  @db.Uuid
+  title       String
+  description String?
+  role_id     String?  @db.Uuid
+  unit_id     String?  @db.Uuid
+  sort_order  Int      @default(0)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("leadership_positions")
+}
+
+model LeadershipAssignment {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenant_id           String   @db.Uuid
+  position_id         String   @db.Uuid
+  membership_id       String   @unique @db.Uuid
+  assigned_by_user_id String   @db.Uuid
+  assigned_at         DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("leadership_assignments")
+}
+
+// ───────────────────────────── Groups v2 / Events v2 ─────────────────────────────
+
+model GroupRole {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenant_id    String   @db.Uuid
+  key          String
+  name         String
+  capabilities String[] @default([])
+  rank         Int      @default(100)
+  is_system    Boolean  @default(false)
+  created_at   DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([tenant_id, key])
+  @@map("group_roles")
+}
+
+model EventReview {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenant_id        String    @db.Uuid
+  event_id         String    @db.Uuid
+  reviewer_user_id String    @db.Uuid
+  status           String    @default("pending")
+  comment          String?
+  decided_at       DateTime? @db.Timestamptz(6)
+  created_at       DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@unique([event_id, reviewer_user_id])
+  @@map("event_reviews")
+}
+
+// ───────────────────────────── Organisation structure ─────────────────────────────
+
+// An independently registered church joining a parent organisation. Not
+// tenant-scoped in the usual sense: visible to both sides (RLS).
+model OrganizationAffiliation {
+  id                   String    @id @default(uuid()) @db.Uuid
+  child_org_id         String    @db.Uuid
+  parent_org_id        String    @db.Uuid
+  initiated_by_org_id  String    @db.Uuid
+  status               String    @default("requested")
+  grants               String[]
+  message              String?
+  requested_by_user_id String    @db.Uuid
+  requested_at         DateTime  @default(now()) @db.Timestamptz(6)
+  decided_by_user_id   String?   @db.Uuid
+  decided_at           DateTime? @db.Timestamptz(6)
+  decision_note        String?
+  effective_from       DateTime? @db.Timestamptz(6)
+  ended_by_user_id     String?   @db.Uuid
+  ended_at             DateTime? @db.Timestamptz(6)
+  end_reason           String?
+
+  @@map("organization_affiliations")
+}
+
+model OrganizationConfiguration {
+  tenant_id          String   @id @db.Uuid
+  terminology        Json     @default("{}")
+  updated_by_user_id String?  @db.Uuid
+  updated_at         DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("organization_configurations")
 }

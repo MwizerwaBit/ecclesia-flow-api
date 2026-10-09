@@ -1,0 +1,103 @@
+# Required checks for every pull request (DIF-02, DIF-14).
+# Branch protection on master must mark lint, test, security and secrets as
+# "required" for a failing check to block merging (FORYOU.md).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+  workflow_call: # reused by release.yml as its gate
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "ruff>=0.7"
+      - name: Lint
+        run: ruff check app tests scripts
+      - name: Formatting
+        run: ruff format --check app tests scripts
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ecclesia_owner
+          POSTGRES_PASSWORD: ci_owner_only
+          POSTGRES_DB: ecclesia_flow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ecclesia_owner"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      ENVIRONMENT: test
+      # CI-only throwaway credentials for a database that lives for one job.
+      DATABASE_URL: postgresql://ecclesia_owner:ci_owner_only@localhost:5432/ecclesia_flow
+      DATABASE_URL_APP: postgresql://app_tenant:change_me_tenant_pw@localhost:5432/ecclesia_flow
+      DATABASE_URL_PLATFORM: postgresql://app_platform:change_me_platform_pw@localhost:5432/ecclesia_flow
+      APP_TENANT_DB_PASSWORD: change_me_tenant_pw
+      APP_PLATFORM_DB_PASSWORD: change_me_platform_pw
+      JWT_SECRET: ci-only-jwt-secret-not-used-anywhere-else-000000
+      DEV_AUTO_ACTIVATE_ORGS: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Generate Prisma client
+        run: python -m prisma generate
+      # Every migration applied in order to an empty database: the
+      # "migrations work from scratch" check (DIF-04).
+      - name: Apply migrations to a clean database
+        run: python -m prisma migrate deploy
+      - name: Migration history is consistent
+        run: python -m prisma migrate status
+      - name: Tests
+        run: python -m pytest -q -p no:warnings
+
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e . pip-audit bandit
+      # Thresholds and exceptions: docs/SECURE_DEVELOPMENT.md
+      - name: Dependency vulnerabilities
+        run: pip-audit --skip-editable
+      - name: Static security analysis (medium+ severity and confidence)
+        run: bandit -r app scripts -ll -ii -q
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan history for committed secrets
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect --source=/repo --no-banner --redact

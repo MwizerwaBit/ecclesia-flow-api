@@ -14,6 +14,9 @@ class PublicChurchSummary(BaseModel):
     country: str
     logo_url: str | None
     primary_color: str | None
+    city: str | None = None
+    #: Government registration certificate reviewed and accepted.
+    verified: bool = False
 
 
 class OrganizationRead(BaseModel):

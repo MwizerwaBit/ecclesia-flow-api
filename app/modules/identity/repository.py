@@ -93,9 +93,11 @@ async def store_refresh_token(
     expires_at: datetime,
     user_agent: str | None,
     ip_address: str | None,
+    mfa_verified: bool = False,
 ) -> RefreshToken:
     return await db.refreshtoken.create(
         data={
+            "mfa_verified": mfa_verified,
             "user_id": user_id,
             "membership_id": membership_id,
             "token_hash": token_hash,
@@ -124,4 +126,70 @@ async def revoke_refresh_token_family(db: Prisma, family_id: str) -> None:
     await db.refreshtoken.update_many(
         where={"family_id": family_id, "revoked_at": None},
         data={"revoked_at": datetime.now(UTC)},
+    )
+
+
+# ───────────────────────────── Lockout ─────────────────────────────
+
+
+async def record_failed_login(db: Prisma, user_id: str, *, max_failures: int, lockout_minutes: int) -> bool:
+    """Counts one failure; locks the account once the threshold is reached.
+    Returns True when this failure triggered the lock."""
+    rows = await db.query_raw(
+        """
+        update users set
+          failed_login_count = failed_login_count + 1,
+          last_failed_login_at = now(),
+          locked_until = case when failed_login_count + 1 >= $2::int
+                              then now() + make_interval(mins => $3::int) else locked_until end
+        where id = $1::uuid
+        returning failed_login_count
+        """,
+        user_id,
+        max_failures,
+        lockout_minutes,
+    )
+    if rows and rows[0]["failed_login_count"] >= max_failures:
+        await db.execute_raw("update users set failed_login_count = 0 where id = $1::uuid", user_id)
+        return True
+    return False
+
+
+async def clear_failed_logins(db: Prisma, user_id: str) -> None:
+    await db.execute_raw("update users set failed_login_count = 0, locked_until = null where id = $1::uuid", user_id)
+
+
+# ───────────────────────────── Invitations ─────────────────────────────
+
+
+async def find_membership_by_invite_hash(db: Prisma, token_hash: str) -> TenantMembership | None:
+    return await db.tenantmembership.find_unique(where={"invite_token_hash": token_hash})
+
+
+async def accept_membership_invite(db: Prisma, membership_id: str) -> None:
+    await db.tenantmembership.update(
+        where={"id": membership_id},
+        data={
+            "status": "active",
+            "accepted_at": datetime.now(UTC),
+            "invite_token_hash": None,
+            "invite_expires_at": None,
+        },
+    )
+
+
+async def set_password(db: Prisma, user_id: str, *, password_hash: str, first_name: str, last_name: str) -> None:
+    # password_changed_at uses the database clock (transaction time), the same
+    # clock that stamps refresh_tokens.created_at — so a session issued in the
+    # same transaction is never mistaken for one from before the change.
+    await db.execute_raw(
+        """
+        update users set password_hash = $2, first_name = coalesce(nullif($3, ''), first_name),
+               last_name = coalesce(nullif($4, ''), last_name), password_changed_at = now()
+        where id = $1::uuid
+        """,
+        user_id,
+        password_hash,
+        first_name,
+        last_name,
     )

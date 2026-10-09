@@ -1,4 +1,6 @@
-from prisma import Json, Prisma
+import json
+
+from prisma import Prisma
 
 
 async def write_audit(
@@ -14,19 +16,25 @@ async def write_audit(
     is_impersonated: bool = False,
     impersonated_by_user_id: str | None = None,
 ) -> None:
-    data = {
-        "tenant_id": tenant_id,
-        "actor_user_id": actor_user_id,
-        "action": action,
-        "resource_type": resource_type,
-        "resource_id": resource_id,
-        "ip_address": ip_address,
-        "is_impersonated": is_impersonated,
-        "impersonated_by_user_id": impersonated_by_user_id,
-    }
-    # Prisma's nullable-Json input type wants the key OMITTED for "no value,"
-    # not present-and-None — passing `"metadata": None` explicitly raises
-    # MissingRequiredValueError even though the column itself is nullable.
-    if metadata is not None:
-        data["metadata"] = Json(metadata)
-    await db.auditlog.create(data=data)
+    """Append one audit entry. The database chains it (chain_seq, prev_hash,
+    row_hash) and refuses any later change — see migration 20261009120000.
+
+    A plain INSERT with nothing read back: account-level entries (tenant_id
+    NULL) may be appended from a tenant session but never read by one, and
+    an INSERT ... RETURNING would need read access too."""
+    await db.execute_raw(
+        """
+        insert into audit_logs (id, tenant_id, actor_user_id, action, resource_type, resource_id,
+                                metadata, ip_address, is_impersonated, impersonated_by_user_id)
+        values (gen_random_uuid(), $1::uuid, $2::uuid, $3, $4, $5::uuid, $6::jsonb, $7::inet, $8, $9::uuid)
+        """,
+        tenant_id,
+        actor_user_id,
+        action,
+        resource_type,
+        resource_id,
+        json.dumps(metadata, default=str) if metadata is not None else None,
+        ip_address,
+        is_impersonated,
+        impersonated_by_user_id,
+    )

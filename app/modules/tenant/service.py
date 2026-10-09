@@ -3,6 +3,7 @@ import re
 from prisma import Prisma
 from prisma.models import Organization
 
+from app.core.database import set_tenant_context
 from app.modules.tenant import repository
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -48,9 +49,34 @@ async def create_organization_with_root_unit(
         currency=currency,
         timezone_name=timezone_name,
     )
-    await db.execute_raw("select set_config('app.tenant_id', $1, true)", org.id)
+    await set_tenant_context(db, org.id)
 
     root_unit = await db.hierarchyunit.create(
         data={"tenant_id": org.id, "parent_id": None, "name": display_name, "type": "Church"}
     )
+    await seed_default_group_roles(db, org.id)
     return org, root_unit.id
+
+
+# The built-in group roles every church starts with; churches add their own
+# (Secretary, Treasurer…) alongside. Mirrors the backfill in migration
+# 20261005090000.
+DEFAULT_GROUP_ROLES = [
+    ("leader", "Leader", ["manage_roster", "edit_group", "message", "manage_events"], 0),
+    ("assistant", "Assistant", ["manage_roster", "message"], 10),
+    ("member", "Member", [], 100),
+]
+
+
+async def seed_default_group_roles(db: Prisma, tenant_id: str) -> None:
+    for key, name, capabilities, rank in DEFAULT_GROUP_ROLES:
+        await db.grouprole.create(
+            data={
+                "tenant_id": tenant_id,
+                "key": key,
+                "name": name,
+                "capabilities": capabilities,
+                "rank": rank,
+                "is_system": True,
+            }
+        )

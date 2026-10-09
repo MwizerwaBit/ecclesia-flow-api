@@ -5,6 +5,7 @@ The rule this module enforces: nothing but these types (or FastAPI's own
 unexpected exception is logged with a correlation id and the client gets a
 generic 500 — never a stack trace, a SQL fragment, or an internal file path.
 """
+
 import logging
 import uuid
 
@@ -52,6 +53,15 @@ class StepUpRequiredError(ForbiddenError):
     code = "step_up_required"
 
 
+class AccountLockedError(AppError):
+    status_code = status.HTTP_423_LOCKED
+    code = "account_locked"
+
+    def __init__(self, message: str, *, locked_until=None):
+        super().__init__(message)
+        self.locked_until = locked_until
+
+
 class RateLimitedError(AppError):
     status_code = status.HTTP_429_TOO_MANY_REQUESTS
     code = "rate_limited"
@@ -65,10 +75,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=_error_body(exc.code, exc.message, request_id),
-        )
+        body = _error_body(exc.code, exc.message, request_id)
+        if isinstance(exc, AccountLockedError) and exc.locked_until is not None:
+            body["error"]["lockedUntil"] = exc.locked_until.isoformat()
+        return JSONResponse(status_code=exc.status_code, content=body)
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

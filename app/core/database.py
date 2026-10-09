@@ -20,6 +20,7 @@ A transaction (``client.tx()``) is Prisma's unit that can mix raw SQL
 against the SAME underlying connection — the equivalent of the SQLAlchemy
 ``AsyncSession`` this module used to wrap.
 """
+
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -45,10 +46,33 @@ async def disconnect_clients() -> None:
         await platform_client.disconnect()
 
 
+#: ``app.unit_scope`` value for a session that covers the whole church.
+WHOLE_CHURCH = "all"
+
+
+async def set_tenant_context(db: Prisma, tenant_id: str, *, unit_scope: str | None = WHOLE_CHURCH) -> None:
+    """Pin the tenant (and unit scope) for the rest of this transaction.
+
+    ``app.unit_scope`` is ``'all'`` or the uuid of the unit a branch-scoped
+    session is limited to; the unit-scope RLS policies on people data match
+    nothing when it is unset, so every place that sets ``app.tenant_id``
+    sets this too — through here."""
+    await db.execute_raw("select set_config('app.tenant_id', $1, true)", tenant_id)
+    await db.execute_raw("select set_config('app.unit_scope', $1, true)", unit_scope or WHOLE_CHURCH)
+
+
+async def clear_tenant_context(db: Prisma) -> None:
+    await db.execute_raw("select set_config('app.tenant_id', '', true)")
+    await db.execute_raw("select set_config('app.unit_scope', '', true)")
+
+
 @asynccontextmanager
-async def tenant_session(tenant_id: str, user_id: str | None = None) -> AsyncGenerator[Prisma, None]:
-    """Open a transaction on the ``app_tenant`` role with ``app.tenant_id``
-    (and optionally ``app.user_id``) pinned for that transaction only.
+async def tenant_session(
+    tenant_id: str, user_id: str | None = None, unit_scope_id: str | None = None
+) -> AsyncGenerator[Prisma, None]:
+    """Open a transaction on the ``app_tenant`` role with ``app.tenant_id``,
+    ``app.unit_scope`` (and optionally ``app.user_id``) pinned for that
+    transaction only.
 
     ``set_config(..., true)`` scopes to the current transaction, so a pooled
     connection can never leak one request's tenant context into the next —
@@ -59,7 +83,7 @@ async def tenant_session(tenant_id: str, user_id: str | None = None) -> AsyncGen
     cast.)
     """
     async with tenant_client.tx() as tx:
-        await tx.execute_raw("select set_config('app.tenant_id', $1, true)", tenant_id)
+        await set_tenant_context(tx, tenant_id, unit_scope=unit_scope_id)
         if user_id:
             await tx.execute_raw("select set_config('app.user_id', $1, true)", user_id)
         yield tx

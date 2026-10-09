@@ -7,6 +7,7 @@ collide, which is a pragmatic tradeoff for this pass rather than standing up
 a fully ephemeral test database. A follow-up could move this to a
 transactional-rollback-per-test fixture against a dedicated test schema.
 """
+
 import pyotp
 
 
@@ -33,20 +34,19 @@ async def test_register_assigns_staff_role_and_leadership(client, church_payload
     resp = await client.post("/api/v1/auth/register", json=payload)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["role"] == "staff"
+    # By default the person registering is the church's leader — the most
+    # privileged role, above the administrator.
+    assert body["role"] == "leader"
     assert body["active_membership"]["is_leader"] is True
     assert body["active_membership"]["is_primary"] is True
-    assert "members:export" not in body["permissions"]  # board-only permission
-    assert "members:read" in body["permissions"]
+    assert {"leadership:manage", "admins:manage", "members:read"} <= set(body["permissions"])
 
 
 async def test_login_wrong_password_and_nonexistent_email_match_exactly(client, church_payload):
     payload = church_payload("loginfail")
     await client.post("/api/v1/auth/register", json=payload)
 
-    wrong_pw = await client.post(
-        "/api/v1/auth/login", json={"email": payload["email"], "password": "WrongPassword9"}
-    )
+    wrong_pw = await client.post("/api/v1/auth/login", json={"email": payload["email"], "password": "WrongPassword9"})
     nonexistent = await client.post(
         "/api/v1/auth/login", json={"email": "nobody-" + payload["email"], "password": "WrongPassword9"}
     )
@@ -94,16 +94,12 @@ async def test_mfa_setup_verify_challenge_and_backup_code_is_single_use(client, 
     assert verify.status_code == 204
 
     # Login now demands the MFA challenge instead of a session.
-    login = await client.post(
-        "/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]}
-    )
+    login = await client.post("/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]})
     assert login.status_code == 200
     assert login.json().get("mfa_required") is True
     challenge_token = login.json()["challenge_token"]
 
-    wrong = await client.post(
-        "/api/v1/auth/mfa/challenge", json={"challenge_token": challenge_token, "code": "000000"}
-    )
+    wrong = await client.post("/api/v1/auth/mfa/challenge", json={"challenge_token": challenge_token, "code": "000000"})
     assert wrong.status_code == 401
 
     used_once = await client.post(
@@ -112,9 +108,7 @@ async def test_mfa_setup_verify_challenge_and_backup_code_is_single_use(client, 
     assert used_once.status_code == 200
 
     # Same backup code must not work a second time, even against a fresh challenge.
-    login2 = await client.post(
-        "/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]}
-    )
+    login2 = await client.post("/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]})
     challenge_token2 = login2.json()["challenge_token"]
     reused = await client.post(
         "/api/v1/auth/mfa/challenge", json={"challenge_token": challenge_token2, "code": backup_code}

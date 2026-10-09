@@ -4,6 +4,7 @@ Every function here is pure (no DB access) so it's trivially unit-testable
 and so the one place a timing-safe comparison or a KDF parameter matters is
 never duplicated.
 """
+
 import base64
 import hashlib
 import secrets
@@ -25,6 +26,7 @@ _hasher = PasswordHasher()
 
 
 # ───────────────────────────── Passwords ─────────────────────────────
+
 
 def hash_password(raw: str) -> str:
     return _hasher.hash(raw)
@@ -49,6 +51,7 @@ def needs_rehash(hashed: str) -> bool:
 # so a leaked database never yields a usable token (unlike storing it plain
 # or even with a fast reversible hash).
 
+
 def new_refresh_token() -> str:
     return secrets.token_urlsafe(48)
 
@@ -58,6 +61,7 @@ def hash_refresh_token(token: str) -> str:
 
 
 # ───────────────────────────── JWT access tokens ─────────────────────────────
+
 
 class TokenType(StrEnum):
     ACCESS = "access"
@@ -76,14 +80,20 @@ class AccessTokenClaims(BaseModel):
     platform_admin_level: str | None = None
     mfa_verified: bool = False
     token_type: str = TokenType.ACCESS.value
+    iss: str | None = None
+    aud: str | None = None
     jti: str
     exp: int
     iat: int
 
 
 def _encode(payload: dict[str, Any]) -> str:
+    """Every token this API mints names who issued it and who it is for, so a
+    token signed with the same secret for some other purpose or service is
+    rejected by decode_token rather than accepted on signature alone."""
     settings = get_settings()
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    claims = {**payload, "iss": settings.jwt_issuer, "aud": settings.jwt_audience}
+    return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
 def create_access_token(
@@ -163,7 +173,15 @@ class TokenError(Exception):
 def decode_token(token: str) -> dict[str, Any]:
     settings = get_settings()
     try:
-        return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        return jwt.decode(
+            token,
+            settings.jwt_secret,
+            # Pinned: never trust the token's own "alg" header (alg=none / key confusion).
+            algorithms=[settings.jwt_algorithm],
+            audience=settings.jwt_audience,
+            issuer=settings.jwt_issuer,
+            options={"require": ["exp", "iat", "sub", "jti", "iss", "aud", "token_type"]},
+        )
     except jwt.ExpiredSignatureError as exc:
         raise TokenError("Token has expired") from exc
     except jwt.InvalidTokenError as exc:
@@ -171,6 +189,7 @@ def decode_token(token: str) -> dict[str, Any]:
 
 
 # ───────────────────────────── MFA (TOTP) ─────────────────────────────
+
 
 def _fernet() -> Fernet:
     settings = get_settings()

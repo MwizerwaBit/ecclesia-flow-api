@@ -1,0 +1,28 @@
+# Release gate (DIF-16). A release is a tag `vX.Y.Z` on master.
+# It only proceeds if every CI check passes again on the tagged commit, and
+# the `production` environment's required reviewers approve (configure in
+# GitHub → Settings → Environments; FORYOU.md). Deployment itself is not
+# automated yet — docs/OPERATIONS.md §Release describes the manual steps.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag

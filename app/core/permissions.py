@@ -5,13 +5,28 @@ resource inside the role's assigned branch of the org," using one query
 against the closure table rather than an application-layer tree walk
 (docs/database-design.md §4).
 """
+
 from prisma import Prisma
+
+# Actions sensitive enough that a password alone is not sufficient: bulk
+# export of personal/giving data, changing who can do what, and org-wide
+# configuration. A session that hasn't passed MFA gets a 403 with code
+# "mfa_required", which the frontend turns into "turn on two-step sign-in".
+MFA_REQUIRED_PERMISSIONS: frozenset[str] = frozenset(
+    {
+        "members:export",
+        "finance:export",
+        "roles:create",
+        "org:settings",
+        "domain:manage",
+        "white_label:manage",
+        "affiliations:manage",
+    }
+)
 
 
 async def descendant_unit_ids(db: Prisma, root_unit_id: str) -> set[str]:
-    rows = await db.query_raw(
-        "select descendant_id from hierarchy_closure where ancestor_id = $1::uuid", root_unit_id
-    )
+    rows = await db.query_raw("select descendant_id from hierarchy_closure where ancestor_id = $1::uuid", root_unit_id)
     return {str(row["descendant_id"]) for row in rows}
 
 

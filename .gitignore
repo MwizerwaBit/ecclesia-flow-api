@@ -11,3 +11,8 @@ htmlcov/
 dist/
 build/
 .vscode/
+media_uploads/
+
+# Government certificates and other private uploads — never commit
+private_uploads/
+dev_outbox/

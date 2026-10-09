@@ -8,6 +8,7 @@
 Nothing here ever reads a tenant id, role, or permission list from a request
 header, query param, or body — only from the verified JWT.
 """
+
 from collections.abc import AsyncGenerator, Callable
 from typing import Annotated
 
@@ -15,7 +16,8 @@ from fastapi import Depends, Header
 from prisma import Prisma
 
 from app.core.database import platform_session, tenant_session, unscoped_tenant_session
-from app.core.exceptions import ForbiddenError, StepUpRequiredError, UnauthorizedError
+from app.core.exceptions import AppError, ForbiddenError, StepUpRequiredError, UnauthorizedError
+from app.core.permissions import MFA_REQUIRED_PERMISSIONS
 from app.core.security import AccessTokenClaims, TokenError, TokenType, decode_token
 
 
@@ -40,11 +42,75 @@ CurrentClaims = Annotated[AccessTokenClaims, Depends(get_current_claims)]
 async def get_tenant_db(claims: CurrentClaims) -> AsyncGenerator[Prisma, None]:
     if not claims.tenant_id:
         raise ForbiddenError("No active church selected for this session")
-    async with tenant_session(claims.tenant_id, claims.sub) as tx:
+    # The unit scope comes from the signed token too; _ensure_session_current
+    # rejects the request if it no longer matches the membership.
+    async with tenant_session(claims.tenant_id, claims.sub, claims.unit_scope_id) as tx:
+        await _ensure_session_current(tx, claims)
         yield tx
 
 
+async def _ensure_session_current(db: Prisma, claims: AccessTokenClaims) -> None:
+    """Permissions and unit scope ride in the access token, which lives up to
+    15 minutes. Re-checking the membership on every request means a suspended
+    member, a deactivated account, or a role/scope change takes effect on the
+    very next call instead of whenever the token happens to expire. A stale
+    token gets 401 "session_stale"; the client refreshes and receives the
+    current permissions."""
+    if claims.membership_id is None:
+        # Platform-admin impersonation tokens carry no membership; they are
+        # short-lived and audited separately.
+        return
+    rows = await db.query_raw(
+        """
+        select tm.status, tm.role_id, tm.unit_scope_id, u.status as user_status,
+               u.password_changed_at >= to_timestamp($4::bigint + 1) as password_changed_since
+        from tenant_memberships tm join users u on u.id = tm.user_id
+        where tm.id = $1::uuid and tm.user_id = $2::uuid and tm.tenant_id = $3::uuid
+        """,
+        claims.membership_id,
+        claims.sub,
+        claims.tenant_id,
+        claims.iat,
+    )
+    if not rows:
+        raise UnauthorizedError("This session is no longer valid", code="session_revoked")
+    row = rows[0]
+    if row["password_changed_since"]:
+        # The password changed after this token was issued (e.g. a reset).
+        # Tokens carry whole-second iat, so one issued within the same second
+        # as the change survives at most until it expires (≤15 min); the
+        # refresh tokens were all revoked by the change itself.
+        raise UnauthorizedError("Your password changed — sign in again", code="session_revoked")
+    if row["status"] != "active" or row["user_status"] != "active":
+        raise UnauthorizedError("Your access to this church has been suspended", code="session_revoked")
+    if str(row["role_id"]) != str(claims.role_id) or (row["unit_scope_id"] or None) != (claims.unit_scope_id or None):
+        raise UnauthorizedError("Your role has changed — refresh your session", code="session_stale")
+
+
 TenantDb = Annotated[Prisma, Depends(get_tenant_db)]
+
+
+class OrgInactiveError(AppError):
+    status_code = 402
+    code = "org_inactive"
+
+
+async def require_active_org(claims: CurrentClaims, db: TenantDb) -> None:
+    """Business data is for churches that are live. A pending church can sign
+    in, finish onboarding and pay (those routers don't use this guard); a
+    suspended or closed one can still reach billing and support, nothing else.
+    Platform admins impersonating a church are let through to help it."""
+    if claims.is_platform_admin:
+        return
+    rows = await db.query_raw("select status from organizations where id = $1::uuid", claims.tenant_id)
+    status = rows[0]["status"] if rows else None
+    if status in ("active", "trial"):
+        return
+    if status == "pending":
+        raise OrgInactiveError("Your church isn't active yet — complete payment or wait for activation")
+    if status == "suspended":
+        raise ForbiddenError("This church is suspended. Contact EcclesiaFlow support.", code="org_suspended")
+    raise ForbiddenError("This church's account is closed", code="org_closed")
 
 
 async def get_pre_tenant_db() -> AsyncGenerator[Prisma, None]:
@@ -93,6 +159,8 @@ def require_permission(permission: str) -> Callable:
             return claims
         if permission not in claims.permissions:
             raise ForbiddenError(f"Missing permission: {permission}")
+        if permission in MFA_REQUIRED_PERMISSIONS and not claims.mfa_verified:
+            raise ForbiddenError("Turn on two-step sign-in and sign in with it to do this", code="mfa_required")
         return claims
 
     return _check

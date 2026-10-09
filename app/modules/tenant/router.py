@@ -3,10 +3,11 @@ from prisma.models import Organization
 
 from app.core.deps import PreTenantDb
 from app.core.exceptions import NotFoundError
+from app.core.pagination import PaginatedRoute
 from app.modules.tenant import repository
 from app.modules.tenant.schemas import PublicChurchSummary
 
-router = APIRouter(prefix="/churches", tags=["church-directory"])
+router = APIRouter(route_class=PaginatedRoute, prefix="/churches", tags=["church-directory"])
 
 
 def _to_summary(org: Organization) -> PublicChurchSummary:
@@ -16,6 +17,8 @@ def _to_summary(org: Organization) -> PublicChurchSummary:
         country=org.country,
         logo_url=org.logo_url,
         primary_color=org.primary_color,
+        city=org.city,
+        verified=org.verification_status == "verified",
     )
 
 
