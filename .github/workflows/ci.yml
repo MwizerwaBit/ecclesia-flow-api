@@ -6,7 +6,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [master, main]
+    branches: [master, staging, development]
   workflow_call: # reused by release.yml as its gate
 
 permissions:

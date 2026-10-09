@@ -85,13 +85,16 @@ The proxy in front of the API **[host]** must:
 ## Release
 
 A release is a `vX.Y.Z` tag on `master` (`.github/workflows/release.yml`).
+Code reaches `master` only through `development` → `staging` → `master`
+pull requests ([CONTRIBUTING.md](CONTRIBUTING.md#branching-and-commits)). The
+`staging` branch is what the staging environment runs **[host]**.
 
 1. **Gate.** All CI checks re-run on the tagged commit: lint, formatting,
    migrations on a clean database, tests, dependency audit, static analysis
    and secret scan. Any failure stops the release.
 2. **Approval.** The `production` environment requires an approving reviewer
    in GitHub before the release job runs (FORYOU.md).
-3. **Staging first** **[host]**. Deploy the tag to staging, run migrations
+3. **Staging first** **[host]**. The `staging` branch, at the commit being released, is deployed to staging; run migrations
    there, and smoke-test: sign in, list members, create a gathering,
    `/health/ready`.
 4. **Back up production** and confirm the backup completed (see Backups).
