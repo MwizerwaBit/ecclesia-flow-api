@@ -1,0 +1,20 @@
+# Gitleaks configuration — picked up automatically from the repo root by the
+# `secrets` CI job. Keep every exception narrow and explained.
+[extend]
+useDefault = true
+
+# The default "generic-api-key" rule guesses from variable names. Two places
+# trip it without containing any secret:
+#   - tests/: throwaway passwords for accounts the test suite creates in a
+#     disposable database (e.g. "JoinChurch2026").
+#   - .env.example: deliberately empty placeholders (`STRIPE_WEBHOOK_SECRET=`);
+#     the rule reads across the line break into the next variable.
+# Only that one heuristic rule is relaxed here. Gitleaks' specific rules
+# (Stripe live keys, AWS keys, private keys, JWTs, ...) still scan these files.
+[[allowlists]]
+description = "Test fixtures and empty .env.example placeholders (generic heuristic only)"
+targetRules = ["generic-api-key"]
+paths = [
+  '''^tests/''',
+  '''^\.env\.example$''',
+]
