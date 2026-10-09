@@ -100,4 +100,4 @@ jobs:
         with:
           fetch-depth: 0
       - name: Scan history for committed secrets
-        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect --source=/repo --no-banner --redact
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 detect --source=/repo --no-banner --redact
