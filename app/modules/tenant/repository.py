@@ -51,3 +51,25 @@ async def create_organization(
             "trial_ends_at": datetime.now(UTC) + timedelta(days=30),
         }
     )
+
+
+async def create_root_unit(db: Prisma, *, tenant_id: str, name: str) -> str:
+    unit = await db.hierarchyunit.create(
+        data={"tenant_id": tenant_id, "parent_id": None, "name": name, "type": "Church"}
+    )
+    return unit.id
+
+
+async def create_group_role(
+    db: Prisma, *, tenant_id: str, key: str, name: str, capabilities: list[str], rank: int
+) -> None:
+    await db.grouprole.create(
+        data={
+            "tenant_id": tenant_id,
+            "key": key,
+            "name": name,
+            "capabilities": capabilities,
+            "rank": rank,
+            "is_system": True,
+        }
+    )

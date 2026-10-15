@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 from prisma import Json, Prisma
 
+from app.core.database import set_tenant_context
 from app.core.exceptions import ConflictError, NotFoundError
 from app.modules.activity import recurrence, repository
 from app.modules.activity.schemas import (
@@ -13,6 +14,7 @@ from app.modules.activity.schemas import (
 )
 from app.modules.audit.service import write_audit
 from app.modules.rbac.service import resolve_permissions
+from app.modules.tenant import service as tenant_service
 
 
 def _decorate(row: dict, now: datetime | None = None) -> dict:
@@ -233,6 +235,14 @@ async def occurrences(db: Prisma, event_id: str, window_start: datetime, window_
 
 async def events_for_member(db: Prisma, member_id: str | None) -> list[dict]:
     return [_decorate(r) for r in await repository.list_events_for_member(db, member_id)]
+
+
+async def public_events_for_church(db: Prisma, slug: str) -> list[dict]:
+    """A live church's published, public gatherings, read under RLS exactly
+    like a tenant session."""
+    org = await tenant_service.get_live_org_by_slug(db, slug)
+    await set_tenant_context(db, org.id)
+    return await public_events(db)
 
 
 async def public_events(db: Prisma) -> list[dict]:

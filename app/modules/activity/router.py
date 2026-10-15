@@ -3,9 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 
 from app.core.authz import CurrentScope, ensure_event_readable, ensure_event_writable, ensure_member_visible
-from app.core.database import set_tenant_context
 from app.core.deps import CurrentClaims, PreTenantDb, TenantDb, require_permission
-from app.core.exceptions import NotFoundError
 from app.core.pagination import PaginatedRoute
 from app.modules.activity import service
 from app.modules.activity.schemas import (
@@ -185,9 +183,4 @@ public_router = APIRouter(route_class=PaginatedRoute, prefix="/churches", tags=[
 @public_router.get("/{slug}/events", response_model=list[PublicEvent])
 async def public_events(slug: str, db: PreTenantDb):
     """A live church's published, public gatherings — nothing else."""
-    org = await db.organization.find_unique(where={"slug": slug})
-    if org is None or org.status not in ("trial", "active"):
-        raise NotFoundError("No church found at this address")
-    # Read this one church's rows under RLS, exactly like a tenant session.
-    await set_tenant_context(db, org.id)
-    return await service.public_events(db)
+    return await service.public_events_for_church(db, slug)

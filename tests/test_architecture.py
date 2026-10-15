@@ -58,8 +58,10 @@ def _module_of(path: Path) -> str:
     return path.relative_to(MODULES).parts[0]
 
 
-def _db_calls(tree: ast.AST) -> int:
-    """Calls like db.member.find_many(...), tx.query_raw(...), set_tenant_context(...)."""
+def _db_calls(tree: ast.AST, *, is_router: bool) -> int:
+    """Calls like db.member.find_many(...) or tx.query_raw(...). In routers,
+    also setting the RLS session context: that is a service's job (a
+    pre-tenant workflow such as registration may do it through app.core)."""
     count = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -74,7 +76,7 @@ def _db_calls(tree: ast.AST) -> int:
                     count += 1
             elif func.attr == "tx" and isinstance(func.value, ast.Name):
                 count += 1
-        elif isinstance(func, ast.Name) and func.id in {"set_tenant_context", "clear_tenant_context"}:
+        elif is_router and isinstance(func, ast.Name) and func.id in {"set_tenant_context", "clear_tenant_context"}:
             count += 1
     return count
 
@@ -95,7 +97,6 @@ def _imports(tree: ast.AST) -> list[str]:
 
 #: Files outside repository.py that still query the database directly.
 KNOWN_DB_ACCESS_OUTSIDE_REPOSITORIES: set[str] = {
-    "activity/router.py",
     "activity/service.py",
     "affiliations/service.py",
     "audit/integrity.py",
@@ -112,11 +113,10 @@ KNOWN_DB_ACCESS_OUTSIDE_REPOSITORIES: set[str] = {
     "platform_admin/router.py",
     "platform_admin/service.py",
     "portal/service.py",
-    "tenant/service.py",
 }
 
 #: Routers that still import a repository (their own or another module's).
-KNOWN_ROUTER_REPOSITORY_IMPORTS: set[str] = {"billing/router.py", "identity/router.py", "tenant/router.py"}
+KNOWN_ROUTER_REPOSITORY_IMPORTS: set[str] = {"billing/router.py", "identity/router.py"}
 
 #: (importer, imported) cross-module imports of a repository or router.
 KNOWN_CROSS_MODULE_INTERNALS: set[tuple[str, str]] = {
@@ -136,7 +136,7 @@ def _collect():
     db_access, router_repo, cross, fastapi_in_service = set(), set(), set(), set()
     for path, tree in _module_files():
         rel, mod = _rel(path), _module_of(path)
-        if path.name != "repository.py" and _db_calls(tree):
+        if path.name != "repository.py" and _db_calls(tree, is_router=path.name == "router.py"):
             db_access.add(rel)
         for name in _imports(tree):
             parts = name.split(".")

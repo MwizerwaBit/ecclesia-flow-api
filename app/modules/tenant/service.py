@@ -4,6 +4,7 @@ from prisma import Prisma
 from prisma.models import Organization
 
 from app.core.database import set_tenant_context
+from app.core.exceptions import NotFoundError
 from app.modules.tenant import repository
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -51,11 +52,9 @@ async def create_organization_with_root_unit(
     )
     await set_tenant_context(db, org.id)
 
-    root_unit = await db.hierarchyunit.create(
-        data={"tenant_id": org.id, "parent_id": None, "name": display_name, "type": "Church"}
-    )
+    root_unit_id = await repository.create_root_unit(db, tenant_id=org.id, name=display_name)
     await seed_default_group_roles(db, org.id)
-    return org, root_unit.id
+    return org, root_unit_id
 
 
 # The built-in group roles every church starts with; churches add their own
@@ -70,13 +69,39 @@ DEFAULT_GROUP_ROLES = [
 
 async def seed_default_group_roles(db: Prisma, tenant_id: str) -> None:
     for key, name, capabilities, rank in DEFAULT_GROUP_ROLES:
-        await db.grouprole.create(
-            data={
-                "tenant_id": tenant_id,
-                "key": key,
-                "name": name,
-                "capabilities": capabilities,
-                "rank": rank,
-                "is_system": True,
-            }
+        await repository.create_group_role(
+            db, tenant_id=tenant_id, key=key, name=name, capabilities=capabilities, rank=rank
         )
+
+
+# ── Public church directory ─────────────────────────────────────────────
+
+
+def _public_summary(org: Organization) -> dict:
+    return {
+        "slug": org.slug,
+        "display_name": org.display_name,
+        "country": org.country,
+        "logo_url": org.logo_url,
+        "primary_color": org.primary_color,
+        "city": org.city,
+        "verified": org.verification_status == "verified",
+    }
+
+
+async def get_live_org_by_slug(db: Prisma, slug: str) -> Organization:
+    """A church that is publicly visible. Suspended or closed churches 404
+    exactly like ones that don't exist (matches the frontend's
+    DISCOVERABLE_STATUSES)."""
+    org = await repository.get_by_slug(db, slug)
+    if org is None or org.status not in repository.DISCOVERABLE_STATUSES:
+        raise NotFoundError("No church found at this address")
+    return org
+
+
+async def search_public_churches(db: Prisma, query: str | None) -> list[dict]:
+    return [_public_summary(o) for o in await repository.search_public(db, query)]
+
+
+async def public_church(db: Prisma, slug: str) -> dict:
+    return _public_summary(await get_live_org_by_slug(db, slug))
