@@ -3,12 +3,12 @@ onboarding. Deliberately NOT behind the active-organisation gate — a church
 still waiting for activation must be able to finish onboarding."""
 
 from fastapi import APIRouter, Depends, File, UploadFile
-from fastapi.responses import Response
 
 from app.core.authz import CurrentScope
 from app.core.deps import CurrentClaims, TenantDb, require_any_permission, require_permission
 from app.core.exceptions import ForbiddenError
 from app.core.pagination import PaginatedRoute
+from app.core.responses import attachment_response
 from app.modules.org import service, terminology
 from app.modules.org.schemas import (
     InvitePersonInput,
@@ -117,18 +117,4 @@ async def upload_certificate(claims: CurrentClaims, db: TenantDb, file: UploadFi
 @router.get("/documents/{document_id}/download", dependencies=[Depends(require_permission("org:documents"))])
 async def download_document(document_id: str, claims: CurrentClaims, db: TenantDb):
     data, mime, name = await service.read_document(db, claims.tenant_id, document_id)
-    return document_response(data, mime, name)
-
-
-def document_response(data: bytes, mime: str, name: str) -> Response:
-    """Always an attachment, never rendered inline by the browser, never cached."""
-    safe_name = "".join(c for c in name if c.isalnum() or c in "._- ")[:100] or "document"
-    return Response(
-        content=data,
-        media_type=mime,
-        headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "no-store",
-        },
-    )
+    return attachment_response(data, mime, name)

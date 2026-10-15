@@ -18,7 +18,6 @@ from app.modules.finance.schemas import (
     PledgeRead,
     VoidDonationInput,
 )
-from app.modules.people import service as people_service
 
 router = APIRouter(route_class=PaginatedRoute, prefix="/finance", tags=["finance"])
 
@@ -125,8 +124,7 @@ async def get_contribution_statement(
     # with only giving:read_own can only ever pull their own — resolved by
     # looking up which member record (if any) this login is linked to,
     # never by trusting a role name alone.
-    own_member = await people_service.get_member_by_user_id(db, claims.sub)
-    is_own = own_member is not None and own_member["id"] == member_id
+    is_own = await service.is_own_member_record(db, claims.sub, member_id)
     if is_own and "giving:read_own" in claims.permissions:
         return await service.generate_contribution_statement(db, member_id, year)
     # Anyone else's statement: the export permission (which also demands an

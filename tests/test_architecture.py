@@ -101,7 +101,6 @@ KNOWN_DB_ACCESS_OUTSIDE_REPOSITORIES: set[str] = {
     "affiliations/service.py",
     "audit/integrity.py",
     "audit/service.py",
-    "billing/service.py",
     "groups/service.py",
     "hierarchy/service.py",
     "identity/recovery.py",
@@ -110,30 +109,27 @@ KNOWN_DB_ACCESS_OUTSIDE_REPOSITORIES: set[str] = {
     "membership/service.py",
     "org/lifecycle.py",
     "org/terminology.py",
-    "platform_admin/router.py",
-    "platform_admin/service.py",
     "portal/service.py",
 }
 
 #: Routers that still import a repository (their own or another module's).
-KNOWN_ROUTER_REPOSITORY_IMPORTS: set[str] = {"billing/router.py", "identity/router.py"}
+KNOWN_ROUTER_REPOSITORY_IMPORTS: set[str] = set()
 
 #: (importer, imported) cross-module imports of a repository or router.
 KNOWN_CROSS_MODULE_INTERNALS: set[tuple[str, str]] = {
-    ("billing/router.py", "identity.repository"),
     ("identity/service.py", "people.repository"),
-    ("platform_admin/router.py", "org.router"),
-    ("platform_admin/service.py", "org.repository"),
-    ("platform_admin/service.py", "rbac.repository"),
     ("portal/service.py", "groups.repository"),
 }
+
+#: Routers calling another module's service (controllers use their own service).
+KNOWN_ROUTER_FOREIGN_SERVICES: set[tuple[str, str]] = set()
 
 #: Services (and other non-router module files) importing FastAPI.
 KNOWN_FASTAPI_IN_SERVICES: set[str] = {"media/service.py"}
 
 
 def _collect():
-    db_access, router_repo, cross, fastapi_in_service = set(), set(), set(), set()
+    db_access, router_repo, cross, fastapi_in_service, router_foreign = set(), set(), set(), set(), set()
     for path, tree in _module_files():
         rel, mod = _rel(path), _module_of(path)
         if path.name != "repository.py" and _db_calls(tree, is_router=path.name == "router.py"):
@@ -146,9 +142,11 @@ def _collect():
                     router_repo.add(rel)
                 if other != mod and sub in {"repository", "router"}:
                     cross.add((rel, f"{other}.{sub}"))
+                if path.name == "router.py" and other != mod and sub == "service":
+                    router_foreign.add((rel, f"{other}.service"))
             if path.name != "router.py" and parts[0] == "fastapi":
                 fastapi_in_service.add(rel)
-    return db_access, router_repo, cross, fastapi_in_service
+    return db_access, router_repo, cross, fastapi_in_service, router_foreign
 
 
 def _check(found: set, known: set, what: str) -> None:
@@ -168,6 +166,10 @@ def test_routers_never_import_repositories():
 
 def test_modules_never_import_each_others_internals():
     _check(_collect()[2], KNOWN_CROSS_MODULE_INTERNALS, "cross-module repository/router imports")
+
+
+def test_routers_only_call_their_own_service():
+    _check(_collect()[4], KNOWN_ROUTER_FOREIGN_SERVICES, "router → other module's service imports")
 
 
 def test_services_are_framework_free():

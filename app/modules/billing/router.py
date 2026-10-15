@@ -16,7 +16,6 @@ from app.modules.billing.schemas import (
     DemoPayResult,
     PlanRead,
 )
-from app.modules.identity import repository as identity_repository
 
 router = APIRouter(route_class=PaginatedRoute, prefix="/billing", tags=["billing"])
 MANAGE = [Depends(require_permission("billing:manage"))]
@@ -36,8 +35,7 @@ async def overview(claims: CurrentClaims, db: TenantDb):
 @router.post("/checkout", response_model=CheckoutRead, dependencies=MANAGE)
 @limiter.limit("10/minute")
 async def create_checkout(request: Request, payload: CheckoutInput, claims: CurrentClaims, db: TenantDb):
-    user = await identity_repository.get_user_by_id(db, claims.sub)
-    return await service.create_checkout(db, claims.tenant_id, claims.sub, user.email, payload)
+    return await service.create_checkout(db, claims.tenant_id, claims.sub, payload)
 
 
 @router.get("/demo/checkout/{session_id}", response_model=DemoCheckoutRead, dependencies=MANAGE)

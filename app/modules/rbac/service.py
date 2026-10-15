@@ -37,3 +37,7 @@ async def create_role(db: Prisma, *, tenant_id: str, name: str, color: str | Non
         "member_count": 0,
         "created_at": role.created_at,
     }
+
+
+async def get_system_role_by_name(db: Prisma, name: str):
+    return await repository.get_system_role_by_name(db, name)

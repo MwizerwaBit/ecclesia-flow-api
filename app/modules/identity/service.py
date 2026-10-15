@@ -46,6 +46,14 @@ async def _set_user_scope(db: Prisma, user_id: str) -> None:
     await db.execute_raw("select set_config('app.user_id', $1, true)", user_id)
 
 
+async def get_active_user(db: Prisma, user_id: str) -> User:
+    """The account behind a valid token, or 401 if it no longer exists."""
+    user = await repository.get_user_by_id(db, user_id)
+    if user is None:
+        raise UnauthorizedError("Account no longer exists")
+    return user
+
+
 async def _membership_summaries(db: Prisma, user_id: str) -> list[MembershipSummary]:
     await _set_user_scope(db, user_id)
     rows = await repository.list_memberships_for_user(db, user_id)

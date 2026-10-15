@@ -262,3 +262,7 @@ async def platform_metrics_counts(db: Prisma) -> dict:
         "new_signups_this_month": new_month,
         "trials_ending_in_7_days": trials_ending_rows,
     }
+
+
+async def count_active_sessions(db: Prisma) -> int:
+    return await db.refreshtoken.count(where={"revoked_at": None, "expires_at": {"gt": datetime.now(UTC)}})

@@ -17,10 +17,12 @@ from prisma import Prisma
 from app.core.config import get_settings
 from app.core.database import platform_session
 from app.core.exceptions import AppError, ConflictError, NotFoundError
-from app.modules.billing import signatures
+from app.modules.billing import repository, signatures
 from app.modules.billing.providers import CheckoutRequest, DemoProvider, get_provider, provider_by_name
 from app.modules.billing.schemas import CheckoutInput, DemoPayInput
+from app.modules.identity import service as identity_service
 from app.modules.org import lifecycle
+from app.modules.org import service as org_service
 from app.modules.org.catalogue import MODULES, PLAN_BY_TIER, PLANS, PURCHASABLE_TIERS, tier_at_least
 
 # Stripe's documented test card numbers.
@@ -51,9 +53,9 @@ def list_plans() -> list[dict]:
 
 async def overview(db: Prisma, org_id: str) -> dict:
     settings = get_settings()
-    org = await db.organization.find_unique(where={"id": org_id})
-    subscription = await db.billingsubscription.find_unique(where={"tenant_id": org_id})
-    payments = await db.billingpayment.find_many(where={"tenant_id": org_id}, order={"created_at": "desc"}, take=24)
+    org = await org_service.get_profile(db, org_id)
+    subscription = await repository.get_subscription(db, org_id)
+    payments = await repository.list_payments(db, org_id)
     return {
         "provider": settings.billing_provider,
         "publishable_key": settings.stripe_publishable_key or None,
@@ -64,8 +66,9 @@ async def overview(db: Prisma, org_id: str) -> dict:
     }
 
 
-async def create_checkout(db: Prisma, org_id: str, user_id: str, user_email: str, payload: CheckoutInput) -> dict:
-    org = await db.organization.find_unique(where={"id": org_id})
+async def create_checkout(db: Prisma, org_id: str, user_id: str, payload: CheckoutInput) -> dict:
+    org = await org_service.get_profile(db, org_id)
+    user = await identity_service.get_active_user(db, user_id)
     if org.status == "canceled":
         raise ConflictError("This church's account is closed")
     plan = PLAN_BY_TIER[payload.tier]
@@ -76,7 +79,7 @@ async def create_checkout(db: Prisma, org_id: str, user_id: str, user_email: str
         CheckoutRequest(
             tenant_id=org_id,
             church_name=org.display_name,
-            customer_email=user_email,
+            customer_email=user.email,
             tier=plan.tier,
             plan_name=plan.name,
             interval=payload.interval,
@@ -84,8 +87,9 @@ async def create_checkout(db: Prisma, org_id: str, user_id: str, user_email: str
             currency=settings.billing_currency,
         )
     )
-    await db.billingcheckoutsession.create(
-        data={
+    await repository.create_checkout_session(
+        db,
+        {
             "tenant_id": org_id,
             "provider": provider.name,
             "provider_session_id": result.provider_session_id,
@@ -94,7 +98,7 @@ async def create_checkout(db: Prisma, org_id: str, user_id: str, user_email: str
             "amount_cents": amount,
             "currency": settings.billing_currency,
             "created_by_user_id": user_id,
-        }
+        },
     )
     return {"provider": provider.name, "session_id": result.provider_session_id, "checkout_url": result.url}
 
@@ -105,8 +109,8 @@ async def create_checkout(db: Prisma, org_id: str, user_id: str, user_email: str
 async def _demo_session(db: Prisma, org_id: str, session_id: str):
     if get_settings().billing_provider != "demo":
         raise NotFoundError("No such checkout")
-    session = await db.billingcheckoutsession.find_first(
-        where={"tenant_id": org_id, "provider": "demo", "provider_session_id": session_id}
+    session = await repository.find_checkout_session(
+        db, tenant_id=org_id, provider="demo", provider_session_id=session_id
     )
     if session is None:
         raise NotFoundError("No such checkout")
@@ -115,7 +119,7 @@ async def _demo_session(db: Prisma, org_id: str, session_id: str):
 
 async def demo_checkout(db: Prisma, org_id: str, session_id: str) -> dict:
     session = await _demo_session(db, org_id, session_id)
-    org = await db.organization.find_unique(where={"id": org_id})
+    org = await org_service.get_profile(db, org_id)
     return {
         "session_id": session.provider_session_id,
         "church_name": org.display_name,
@@ -159,7 +163,7 @@ async def demo_pay(db: Prisma, org_id: str, session_id: str, payload: DemoPayInp
     body = json.dumps(event).encode()
     header = signatures.sign(body, DemoProvider().webhook_secret())
     await process_webhook("demo", body, header)
-    org = await db.organization.find_unique(where={"id": org_id})
+    org = await org_service.get_profile(db, org_id)
     return {"status": "paid", "org_status": org.status}
 
 
@@ -177,37 +181,30 @@ async def process_webhook(provider_name: str, body: bytes, signature_header: str
     tenant_id = (obj.get("metadata") or {}).get("tenant_id") or obj.get("client_reference_id")
 
     async with platform_session() as db:
-        inserted = await db.query_raw(
-            """
-            insert into billing_webhook_events (provider, provider_event_id, type, tenant_id, payload)
-            values ($1, $2, $3, $4::uuid, $5::jsonb)
-            on conflict (provider, provider_event_id) do nothing
-            returning id
-            """,
-            provider.name,
-            event["id"],
-            event.get("type", ""),
-            tenant_id,
-            json.dumps(event),
+        event_row_id = await repository.record_webhook_event(
+            db,
+            provider=provider.name,
+            event_id=event["id"],
+            event_type=event.get("type", ""),
+            tenant_id=tenant_id,
+            event=event,
         )
-        if not inserted:
+        if event_row_id is None:
             return {"received": True, "duplicate": True}
 
         if event.get("type") == "checkout.session.completed" and tenant_id:
             await _checkout_completed(db, provider.name, tenant_id, obj)
         elif event.get("type") == "invoice.payment_failed" and tenant_id:
-            await db.billingsubscription.update_many(where={"tenant_id": tenant_id}, data={"status": "past_due"})
+            await repository.set_subscription_status(db, tenant_id, "past_due")
         elif event.get("type") == "customer.subscription.deleted" and tenant_id:
-            await db.billingsubscription.update_many(where={"tenant_id": tenant_id}, data={"status": "canceled"})
-            org = await db.organization.find_unique(where={"id": tenant_id})
+            await repository.set_subscription_status(db, tenant_id, "canceled")
+            org = await org_service.find_org(db, tenant_id)
             if org and org.status == "active" and org.activation_source == "payment":
                 await lifecycle.transition(
                     db, tenant_id, "suspended", actor_user_id=None, source="payment", note="Subscription ended"
                 )
 
-        await db.execute_raw(
-            "update billing_webhook_events set processed_at = now() where id = $1::uuid", inserted[0]["id"]
-        )
+        await repository.mark_webhook_processed(db, event_row_id)
     return {"received": True}
 
 
@@ -217,8 +214,8 @@ async def _checkout_completed(db: Prisma, provider: str, tenant_id: str, obj: di
     interval = metadata.get("interval", "month")
     if tier not in PURCHASABLE_TIERS:
         return
-    session = await db.billingcheckoutsession.find_first(
-        where={"provider": provider, "provider_session_id": obj.get("id"), "tenant_id": tenant_id}
+    session = await repository.find_checkout_session(
+        db, tenant_id=tenant_id, provider=provider, provider_session_id=obj.get("id")
     )
     if session is None or session.status != "open":
         return  # not a checkout we started, or already applied
@@ -228,29 +225,20 @@ async def _checkout_completed(db: Prisma, provider: str, tenant_id: str, obj: di
 
     now = datetime.now(UTC)
     period_end = now + (timedelta(days=365) if interval == "year" else timedelta(days=30))
-    await db.billingcheckoutsession.update(where={"id": session.id}, data={"status": "completed", "completed_at": now})
-    await db.execute_raw(
-        """
-        insert into billing_subscriptions
-          (tenant_id, provider, tier, interval, status, provider_customer_id, provider_subscription_id,
-           current_period_end, updated_at)
-        values ($1::uuid, $2, $3, $4, 'active', $5, $6, $7::timestamptz, now())
-        on conflict (tenant_id) do update set
-          provider = excluded.provider, tier = excluded.tier, interval = excluded.interval, status = 'active',
-          provider_customer_id = excluded.provider_customer_id,
-          provider_subscription_id = excluded.provider_subscription_id,
-          current_period_end = excluded.current_period_end, updated_at = now()
-        """,
-        tenant_id,
-        provider,
-        tier,
-        interval,
-        obj.get("customer"),
-        obj.get("subscription"),
-        period_end.isoformat(),
+    await repository.complete_checkout_session(db, session.id, now)
+    await repository.upsert_active_subscription(
+        db,
+        tenant_id=tenant_id,
+        provider=provider,
+        tier=tier,
+        interval=interval,
+        customer_id=obj.get("customer"),
+        subscription_id=obj.get("subscription"),
+        period_end=period_end,
     )
-    await db.billingpayment.create(
-        data={
+    await repository.create_payment(
+        db,
+        {
             "tenant_id": tenant_id,
             "provider": provider,
             "provider_reference": obj.get("id"),
@@ -259,10 +247,10 @@ async def _checkout_completed(db: Prisma, provider: str, tenant_id: str, obj: di
             "status": "paid",
             "description": f"{PLAN_BY_TIER[tier].name} plan — {'annual' if interval == 'year' else 'monthly'}",
             "paid_at": now,
-        }
+        },
     )
-    org = await db.organization.find_unique(where={"id": tenant_id})
-    if org.status in ("pending", "suspended", "trial", "active"):
+    org = await org_service.find_org(db, tenant_id)
+    if org is not None and org.status in ("pending", "suspended", "trial", "active"):
         await lifecycle.transition(
             db,
             tenant_id,

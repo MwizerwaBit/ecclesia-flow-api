@@ -98,3 +98,7 @@ async def create_document(db: Prisma, data: dict) -> OrgDocument:
 
 async def get_subscription(db: Prisma, tenant_id: str):
     return await db.billingsubscription.find_unique(where={"tenant_id": tenant_id})
+
+
+async def update_document(db: Prisma, document_id: str, data: dict) -> None:
+    await db.orgdocument.update(where={"id": document_id}, data=data)
