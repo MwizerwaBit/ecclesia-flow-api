@@ -18,3 +18,4 @@ ADR from the pull request that implements it (the PR template asks).
 | [0006](0006-consented-affiliations.md) | Parent organisations see only what the child grants, via definer functions | Accepted |
 | [0007](0007-tamper-evident-audit-log.md) | Audit log as per-organisation hash chains with external signed checkpoints | Accepted |
 | [0008](0008-pagination-in-headers.md) | Pagination metadata in headers; bodies stay arrays | Accepted |
+| [0009](0009-mvc-layering-and-boundary-tests.md) | MVC layering mapped onto modules, enforced by boundary tests | Accepted |

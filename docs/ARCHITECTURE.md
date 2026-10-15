@@ -37,10 +37,27 @@ prisma/
   migrations/        hand-written SQL: FKs, checks, RLS, triggers, functions
 ```
 
-Dependencies point inward: router → service → repository. A module talks to
-another module's data through that module's service or repository, never by
-writing to its tables directly. The exception is read-only joins for display,
-such as a unit name next to a member.
+### 1a. Layers and rules (MVC, [ADR-0009](adr/0009-mvc-layering-and-boundary-tests.md))
+
+| Layer | File | May depend on | Must not |
+|---|---|---|---|
+| Controller | `router.py` | its own `service`, `schemas`, `app.core` (auth deps, `authz` guards, pagination) | touch the database, import any repository, hold business rules |
+| Application / domain | `service.py` (+ helpers like `lifecycle.py`) | its own `repository`, other modules' **services** and **schemas**, `app.core` | import FastAPI, import another module's repository or router |
+| Persistence (model) | `repository.py` | Prisma client, `app.core` | contain business decisions |
+| DTOs | `schemas.py` | Pydantic, other schemas | import services or repositories |
+| Infrastructure / policy | `app/core/*` | nothing in `app/modules` | — (raw SQL allowed for RLS context and ABAC attribute lookups) |
+| View | the frontend (`ecclesia-flow-app`) | the HTTP API only | — |
+
+```
+HTTP ──▶ router (controller) ──▶ service ──▶ repository ──▶ PostgreSQL (constraints, RLS, triggers)
+            │                        │
+            └──▶ app/core (auth, authz, pagination, limits) ◀──┘
+```
+
+`tests/test_architecture.py` enforces these rules on every run. Violations
+that existed before the rules are listed there, and the list only shrinks.
+Read-only joins for display, such as a unit name next to a member, are fine
+inside a repository query.
 
 ### Modules
 
