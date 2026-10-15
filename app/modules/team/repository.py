@@ -194,3 +194,7 @@ async def complete_leader_flip(
         where={"tenant_id": tenant_id, "id": nominee_membership_id},
         data={"is_leader": True, "role_id": SYSTEM_ROLE_LEADER_ID, "unit_scope_id": None},
     )
+
+
+async def get_membership(db: Prisma, membership_id: str):
+    return await db.tenantmembership.find_unique(where={"id": membership_id})

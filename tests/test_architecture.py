@@ -101,15 +101,12 @@ KNOWN_DB_ACCESS_OUTSIDE_REPOSITORIES: set[str] = {
     "affiliations/service.py",
     "audit/integrity.py",
     "audit/service.py",
-    "groups/service.py",
     "hierarchy/service.py",
     "identity/recovery.py",
     "identity/service.py",
-    "leadership/service.py",
     "membership/service.py",
     "org/lifecycle.py",
     "org/terminology.py",
-    "portal/service.py",
 }
 
 #: Routers that still import a repository (their own or another module's).
@@ -118,7 +115,6 @@ KNOWN_ROUTER_REPOSITORY_IMPORTS: set[str] = set()
 #: (importer, imported) cross-module imports of a repository or router.
 KNOWN_CROSS_MODULE_INTERNALS: set[tuple[str, str]] = {
     ("identity/service.py", "people.repository"),
-    ("portal/service.py", "groups.repository"),
 }
 
 #: Routers calling another module's service (controllers use their own service).

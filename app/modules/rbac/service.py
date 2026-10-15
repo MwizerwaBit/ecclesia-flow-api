@@ -41,3 +41,7 @@ async def create_role(db: Prisma, *, tenant_id: str, name: str, color: str | Non
 
 async def get_system_role_by_name(db: Prisma, name: str):
     return await repository.get_system_role_by_name(db, name)
+
+
+async def role_exists(db: Prisma, role_id: str) -> bool:
+    return await repository.get_role(db, role_id) is not None

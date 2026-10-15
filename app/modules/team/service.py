@@ -222,3 +222,16 @@ async def cancel_leadership_transfer(db: Prisma, transfer_id: str, requester_use
     if leader is None or leader["user_id"] != requester_user_id:
         raise ForbiddenError("Only the current church leader can cancel a leadership transfer")
     await repository.cancel_transfer(db, transfer_id)
+
+
+# ── Used by other modules (leadership) ─────────────────────────────────
+
+
+async def get_membership(db: Prisma, membership_id: str):
+    return await repository.get_membership(db, membership_id)
+
+
+async def set_membership_access(db: Prisma, membership_id: str, *, role_id: str, unit_scope_id: str | None) -> None:
+    """Change what a team member can do. The next request with an old token
+    gets 401 session_stale and refreshes (app.core.deps)."""
+    await repository.update_assignment(db, membership_id, {"role_id": role_id, "unit_scope_id": unit_scope_id})
