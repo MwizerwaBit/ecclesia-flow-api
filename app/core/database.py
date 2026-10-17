@@ -66,6 +66,13 @@ async def clear_tenant_context(db: Prisma) -> None:
     await db.execute_raw("select set_config('app.unit_scope', '', true)")
 
 
+async def set_user_scope(db: Prisma, user_id: str) -> None:
+    """Pin ``app.user_id`` for the rest of this transaction, without a
+    tenant — the self-visibility carve-out on ``tenant_memberships`` used to
+    list the churches a user belongs to before any tenant is chosen."""
+    await db.execute_raw("select set_config('app.user_id', $1, true)", user_id)
+
+
 @asynccontextmanager
 async def tenant_session(
     tenant_id: str, user_id: str | None = None, unit_scope_id: str | None = None
@@ -85,13 +92,32 @@ async def tenant_session(
     async with tenant_client.tx() as tx:
         await set_tenant_context(tx, tenant_id, unit_scope=unit_scope_id)
         if user_id:
-            await tx.execute_raw("select set_config('app.user_id', $1, true)", user_id)
+            await set_user_scope(tx, user_id)
         yield tx
 
 
 @asynccontextmanager
 async def platform_session() -> AsyncGenerator[Prisma, None]:
     async with platform_client.tx() as tx:
+        yield tx
+
+
+@asynccontextmanager
+async def independent_transaction() -> AsyncGenerator[Prisma, None]:
+    """A fresh transaction on ``app_tenant``, unrelated to the caller's.
+
+    For a write that must survive even when the caller's own request-scoped
+    transaction later rolls back — Prisma has no mid-transaction manual
+    commit, so "commit before raising" has to mean a separate transaction
+    (see docs/SECURITY_NOTES.md §2). Used for recording a failed-login
+    attempt and for burning a stolen refresh-token chain: both must stick
+    even though the caller raises right after.
+
+    No session variable is set here — the caller passes whatever RLS
+    context the write needs (see ``record_failed_login``/
+    ``revoke_refresh_token_family``, which take a bare user id and operate
+    without ``app.tenant_id``)."""
+    async with tenant_client.tx() as tx:
         yield tx
 
 
@@ -107,7 +133,7 @@ async def self_scoped_session(user_id: str) -> AsyncGenerator[Prisma, None]:
     ``app.tenant_id`` is unset.
     """
     async with tenant_client.tx() as tx:
-        await tx.execute_raw("select set_config('app.user_id', $1, true)", user_id)
+        await set_user_scope(tx, user_id)
         yield tx
 
 

@@ -13,6 +13,7 @@ from app.modules.activity.schemas import (
     HeadcountEntry,
 )
 from app.modules.audit.service import write_audit
+from app.modules.groups import service as groups_service
 from app.modules.rbac.service import resolve_permissions
 from app.modules.tenant import service as tenant_service
 
@@ -56,7 +57,7 @@ async def get_event(db: Prisma, event_id: str) -> dict:
 
 
 async def _check_group(db: Prisma, group_id: str | None) -> None:
-    if group_id and await db.group.find_unique(where={"id": group_id}) is None:
+    if group_id and not await groups_service.group_exists(db, group_id):
         raise NotFoundError("No such group")
 
 
@@ -97,7 +98,7 @@ async def update_event(db: Prisma, event_id: str, payload: ChurchEventUpdate) ->
     if data and existing.status == "pending_review":
         # What the reviewers are looking at changed: they review it again.
         data["status"] = "draft"
-        await db.eventreview.delete_many(where={"event_id": event_id})
+        await repository.clear_reviews(db, event_id)
     if data:
         await repository.update_event(db, event_id, data)
     return await get_event(db, event_id)
@@ -131,9 +132,9 @@ async def submit_for_review(
         raise ConflictError(
             "Reviewers must be other team members allowed to review gatherings", code="invalid_reviewer"
         )
-    await db.eventreview.delete_many(where={"event_id": event_id})
+    await repository.clear_reviews(db, event_id)
     for reviewer in reviewers:
-        await db.eventreview.create(data={"tenant_id": tenant_id, "event_id": event_id, "reviewer_user_id": reviewer})
+        await repository.create_review(db, tenant_id=tenant_id, event_id=event_id, reviewer_user_id=reviewer)
     await repository.update_event(db, event_id, {"status": "pending_review", "submitted_at": datetime.now(UTC)})
     await write_audit(
         db,
@@ -155,19 +156,17 @@ async def decide_review(
     event = await repository.get_event(db, event_id)
     if event is None or event.status != "pending_review":
         raise NotFoundError("Nothing to review here")
-    review = await db.eventreview.find_first(where={"event_id": event_id, "reviewer_user_id": reviewer_user_id})
+    review = await repository.find_review(db, event_id, reviewer_user_id)
     if review is None:
         # Not assigned to you: indistinguishable from not existing.
         raise NotFoundError("Nothing to review here")
     if review.status != "pending":
         raise ConflictError("You've already reviewed this")
     now = datetime.now(UTC)
-    await db.eventreview.update(
-        where={"id": review.id}, data={"status": decision, "comment": comment, "decided_at": now}
-    )
+    await repository.record_review_decision(db, review.id, {"status": decision, "comment": comment, "decided_at": now})
     if decision == "changes_requested":
         await repository.update_event(db, event_id, {"status": "changes_requested"})
-    elif await db.eventreview.count(where={"event_id": event_id, "status": {"not": "approved"}}) == 0:
+    elif await repository.count_reviews_not_approved(db, event_id) == 0:
         await repository.update_event(db, event_id, {"status": "published", "published_at": now})
     await write_audit(
         db,

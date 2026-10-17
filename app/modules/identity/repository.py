@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from prisma import Prisma
-from prisma.models import RefreshToken, TenantMembership, User
+from prisma.models import PasswordResetToken, RefreshToken, TenantMembership, User
 
 
 async def get_user_by_email(db: Prisma, email: str) -> User | None:
@@ -175,6 +175,56 @@ async def accept_membership_invite(db: Prisma, membership_id: str) -> None:
             "invite_token_hash": None,
             "invite_expires_at": None,
         },
+    )
+
+
+# ───────────────────────────── Password reset ─────────────────────────────
+
+
+async def count_recent_reset_tokens(db: Prisma, user_id: str, *, since: datetime) -> int:
+    return await db.passwordresettoken.count(where={"user_id": user_id, "created_at": {"gte": since}})
+
+
+async def void_unused_reset_tokens(db: Prisma, user_id: str) -> None:
+    await db.passwordresettoken.update_many(
+        where={"user_id": user_id, "used_at": None}, data={"used_at": datetime.now(UTC)}
+    )
+
+
+async def create_reset_token(
+    db: Prisma, *, user_id: str, token_hash: str, expires_at: datetime, requested_ip: str | None
+) -> PasswordResetToken:
+    return await db.passwordresettoken.create(
+        data={"user_id": user_id, "token_hash": token_hash, "expires_at": expires_at, "requested_ip": requested_ip}
+    )
+
+
+async def get_reset_token_by_hash(db: Prisma, token_hash: str) -> PasswordResetToken | None:
+    return await db.passwordresettoken.find_unique(where={"token_hash": token_hash})
+
+
+async def consume_reset_token(db: Prisma, token_id: str) -> int:
+    """Conditional update: of two simultaneous uses only one updates a row."""
+    return await db.execute_raw(
+        "update password_reset_tokens set used_at = now() where id = $1::uuid and used_at is null", token_id
+    )
+
+
+async def reset_password_and_clear_lockout(db: Prisma, user_id: str, *, password_hash: str) -> None:
+    await db.execute_raw(
+        """
+        update users set password_hash = $2, password_changed_at = now(),
+               failed_login_count = 0, locked_until = null
+         where id = $1::uuid
+        """,
+        user_id,
+        password_hash,
+    )
+
+
+async def revoke_all_refresh_tokens(db: Prisma, user_id: str) -> None:
+    await db.refreshtoken.update_many(
+        where={"user_id": user_id, "revoked_at": None}, data={"revoked_at": datetime.now(UTC)}
     )
 
 

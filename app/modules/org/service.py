@@ -33,6 +33,10 @@ async def find_org(db: Prisma, org_id: str):
     return await repository.get_org(db, org_id)
 
 
+async def find_org_by_slug(db: Prisma, slug: str):
+    return await repository.get_org_by_slug(db, slug)
+
+
 async def get_profile(db: Prisma, org_id: str):
     return await _org_or_404(db, org_id)
 

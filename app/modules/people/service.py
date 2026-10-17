@@ -374,3 +374,8 @@ async def list_visitor_followups(db: Prisma) -> list[dict]:
             }
         )
     return out
+
+
+async def get_member_record(db: Prisma, member_id: str):
+    """The member row as this session may see it (RLS), or None."""
+    return await repository.get_member(db, member_id)

@@ -126,3 +126,7 @@ async def set_units_type_label(db: Prisma, unit_type_id: str, label: str) -> Non
     """hierarchy_units.type mirrors the type's label for typed units, so every
     screen that already shows `type` shows the church's own word."""
     await db.hierarchyunit.update_many(where={"unit_type_id": unit_type_id}, data={"type": label})
+
+
+async def list_typed_children(db: Prisma, unit_id: str) -> list[HierarchyUnit]:
+    return await db.hierarchyunit.find_many(where={"parent_id": unit_id, "unit_type_id": {"not": None}})

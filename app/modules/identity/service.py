@@ -5,7 +5,7 @@ from prisma import Prisma
 from prisma.models import User
 
 from app.core.config import get_settings
-from app.core.database import clear_tenant_context, set_tenant_context, tenant_client
+from app.core.database import clear_tenant_context, independent_transaction, set_tenant_context, set_user_scope
 from app.core.exceptions import AccountLockedError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError
 from app.core.security import (
     TokenError,
@@ -39,11 +39,8 @@ from app.modules.identity.schemas import (
 )
 from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID, SYSTEM_ROLE_NAMES
 from app.modules.rbac.service import resolve_permissions
+from app.modules.tenant import service as tenant_service
 from app.modules.tenant.service import create_organization_with_root_unit
-
-
-async def _set_user_scope(db: Prisma, user_id: str) -> None:
-    await db.execute_raw("select set_config('app.user_id', $1, true)", user_id)
 
 
 async def get_active_user(db: Prisma, user_id: str) -> User:
@@ -55,7 +52,7 @@ async def get_active_user(db: Prisma, user_id: str) -> User:
 
 
 async def _membership_summaries(db: Prisma, user_id: str) -> list[MembershipSummary]:
-    await _set_user_scope(db, user_id)
+    await set_user_scope(db, user_id)
     rows = await repository.list_memberships_for_user(db, user_id)
     return [
         MembershipSummary(
@@ -161,9 +158,10 @@ async def register_church_leader(
         timezone_name=payload.timezone,
     )
     settings = get_settings()
-    await db.organization.update(
-        where={"id": org.id},
-        data={
+    await tenant_service.apply_registration_details(
+        db,
+        org.id,
+        {
             "status": "active" if settings.dev_auto_activate_orgs else "pending",
             "denomination": payload.denomination,
             "registration_number": payload.registration_number,
@@ -254,9 +252,7 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
     from app.modules.people import repository as people_repository
     from app.modules.rbac.models import SYSTEM_ROLE_MEMBER_ID
 
-    org = await db.organization.find_unique(where={"slug": payload.church_slug})
-    if org is None or org.status not in ("active", "trial"):
-        raise NotFoundError("No church found at this address")
+    org = await tenant_service.get_live_org_by_slug(db, payload.church_slug)
     if await repository.get_user_by_email(db, payload.email.lower()) is not None:
         raise ForbiddenError("An account with this email already exists — sign in instead")
 
@@ -288,10 +284,11 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
     }
     if match is not None:
         member_id = match["id"]
-        existing = await db.member.find_unique(where={"id": member_id})
-        await db.member.update(
-            where={"id": member_id},
-            data={
+        existing = await people_repository.get_member(db, member_id)
+        await people_repository.update_member(
+            db,
+            member_id,
+            {
                 "user_id": user.id,
                 # Fill gaps only; never overwrite what the church recorded.
                 **({"email": payload.email.lower()} if not existing.email else {}),
@@ -301,9 +298,10 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
         )
         action = "member.self_linked"
     else:
-        member = await db.member.create(
-            data={
-                "tenant_id": org.id,
+        member = await people_repository.create_member(
+            db,
+            org.id,
+            {
                 "user_id": user.id,
                 "first_name": payload.first_name.strip(),
                 "last_name": payload.last_name.strip(),
@@ -315,7 +313,7 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
                 "join_method": "first_visit",
                 **protected,
                 **consent,
-            }
+            },
         )
         member_id = member.id
         action = "member.self_registered"
@@ -362,7 +360,7 @@ async def _fail_login(user: User | None) -> None:
     if user is None:
         return
     settings = get_settings()
-    async with tenant_client.tx() as tx:
+    async with independent_transaction() as tx:
         await repository.record_failed_login(
             tx, user.id, max_failures=settings.max_failed_logins, lockout_minutes=settings.lockout_minutes
         )
@@ -479,7 +477,7 @@ async def switch_tenant(
     user_agent: str | None,
     ip_address: str | None,
 ) -> SessionResponse:
-    await _set_user_scope(db, user_id)
+    await set_user_scope(db, user_id)
     membership = await repository.get_membership(db, membership_id)
     if membership is None or membership.user_id != user_id or membership.status != "active":
         raise NotFoundError("No such membership for this account")
@@ -514,7 +512,7 @@ async def refresh_session(
         # docs/SECURITY_NOTES.md §2 — Prisma has no mid-transaction manual
         # commit, so "commit before raising" has to mean a separate
         # transaction, not a call on this one).
-        async with tenant_client.tx() as revoke_tx:
+        async with independent_transaction() as revoke_tx:
             await repository.revoke_refresh_token_family(revoke_tx, row.family_id)
         raise UnauthorizedError("Refresh token reuse detected — all sessions for this device chain were revoked")
     if row.expires_at < datetime.now(UTC):

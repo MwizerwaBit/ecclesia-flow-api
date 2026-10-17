@@ -303,3 +303,7 @@ async def delete_membership(db: Prisma, membership_id: str) -> None:
 
 async def count_active_with_role(db: Prisma, group_id: str, role_key: str) -> int:
     return await repository.count_active_with_role(db, group_id, role_key)
+
+
+async def group_exists(db: Prisma, group_id: str) -> bool:
+    return await repository.get_group_record(db, group_id) is not None

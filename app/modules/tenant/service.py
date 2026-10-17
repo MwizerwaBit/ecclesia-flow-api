@@ -89,6 +89,10 @@ def _public_summary(org: Organization) -> dict:
     }
 
 
+async def apply_registration_details(db: Prisma, org_id: str, data: dict) -> None:
+    await repository.update_registration_details(db, org_id, data)
+
+
 async def get_live_org_by_slug(db: Prisma, slug: str) -> Organization:
     """A church that is publicly visible. Suspended or closed churches 404
     exactly like ones that don't exist (matches the frontend's

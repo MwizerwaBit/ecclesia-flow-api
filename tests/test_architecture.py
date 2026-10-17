@@ -96,18 +96,7 @@ def _imports(tree: ast.AST) -> list[str]:
 # ── Ratchets: existing violations, to be removed as modules are refactored ──
 
 #: Files outside repository.py that still query the database directly.
-KNOWN_DB_ACCESS_OUTSIDE_REPOSITORIES: set[str] = {
-    "activity/service.py",
-    "affiliations/service.py",
-    "audit/integrity.py",
-    "audit/service.py",
-    "hierarchy/service.py",
-    "identity/recovery.py",
-    "identity/service.py",
-    "membership/service.py",
-    "org/lifecycle.py",
-    "org/terminology.py",
-}
+KNOWN_DB_ACCESS_OUTSIDE_REPOSITORIES: set[str] = set()
 
 #: Routers that still import a repository (their own or another module's).
 KNOWN_ROUTER_REPOSITORY_IMPORTS: set[str] = set()

@@ -53,6 +53,10 @@ async def create_organization(
     )
 
 
+async def update_registration_details(db: Prisma, org_id: str, data: dict) -> None:
+    await db.organization.update(where={"id": org_id}, data=data)
+
+
 async def create_root_unit(db: Prisma, *, tenant_id: str, name: str) -> str:
     unit = await db.hierarchyunit.create(
         data={"tenant_id": tenant_id, "parent_id": None, "name": name, "type": "Church"}

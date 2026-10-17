@@ -193,3 +193,28 @@ async def submit_headcount(
             "marked_by_user_id": marked_by_user_id,
         }
     )
+
+
+# ── Event reviews ────────────────────────────────────────────────────────
+
+
+async def clear_reviews(db: Prisma, event_id: str) -> None:
+    await db.eventreview.delete_many(where={"event_id": event_id})
+
+
+async def create_review(db: Prisma, *, tenant_id: str, event_id: str, reviewer_user_id: str) -> None:
+    await db.eventreview.create(
+        data={"tenant_id": tenant_id, "event_id": event_id, "reviewer_user_id": reviewer_user_id}
+    )
+
+
+async def find_review(db: Prisma, event_id: str, reviewer_user_id: str):
+    return await db.eventreview.find_first(where={"event_id": event_id, "reviewer_user_id": reviewer_user_id})
+
+
+async def record_review_decision(db: Prisma, review_id: str, data: dict) -> None:
+    await db.eventreview.update(where={"id": review_id}, data=data)
+
+
+async def count_reviews_not_approved(db: Prisma, event_id: str) -> int:
+    return await db.eventreview.count(where={"event_id": event_id, "status": {"not": "approved"}})

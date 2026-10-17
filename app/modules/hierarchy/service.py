@@ -121,7 +121,7 @@ async def update_unit(db: Prisma, unit_id: str, payload: HierarchyUnitUpdate) ->
         await _check_placement(db, unit_type, parent_id)
     if retyping and unit_type is not None:
         # Its sub-units must still be allowed under its new type.
-        for child in await db.hierarchyunit.find_many(where={"parent_id": unit_id, "unit_type_id": {"not": None}}):
+        for child in await repository.list_typed_children(db, unit_id):
             child_type = await repository.get_unit_type(db, child.unit_type_id)
             if child_type and not _may_sit_under(child_type, unit_type):
                 raise AppError(
@@ -208,3 +208,7 @@ async def apply_preset(db: Prisma, tenant_id: str, preset_key: str) -> list[Unit
     for t in preset.types:
         await repository.create_unit_type(db, tenant_id, t.model_dump())
     return await repository.list_unit_types(db)
+
+
+async def unit_exists(db: Prisma, unit_id: str) -> bool:
+    return await repository.get_unit(db, unit_id) is not None
