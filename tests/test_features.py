@@ -383,3 +383,212 @@ async def test_events_go_through_review_and_respect_visibility(client, church_pa
     await client.post(f"/api/v1/events/{private['id']}/publish", headers=lead)
     assert private["id"] not in [e["id"] for e in (await client.get("/api/v1/me/events", headers=member_h)).json()]
     assert private["id"] not in [e["id"] for e in (await client.get(f"/api/v1/churches/{slug}/events")).json()]
+
+
+async def test_schedule_collisions_count_shared_members_and_flag_leaders(client, church_payload):
+    """Someone who leads both a choir and a youth group can't be in two
+    places — the check is about that overlap, not just "two events at once"
+    (two unrelated groups meeting at the same time isn't anyone's problem)."""
+    from app.core.database import platform_session
+
+    _, leader, lead = await _church(client, church_payload, "collide")
+    slug = (await client.get("/api/v1/org/profile", headers=lead)).json()["slug"]
+    tenant_id = leader["active_membership"]["tenant_id"]
+
+    leah, leah_member = await _joined_member(client, slug, leader, "Leah", "LEAH0099")
+    leah_h = auth(leah["access_token"])
+    bystander = (await client.post("/api/v1/members", json=adult_member("Bystander"), headers=lead)).json()
+    outsider = (await client.post("/api/v1/members", json=adult_member("Outsider"), headers=lead)).json()
+
+    choir = (await client.post("/api/v1/groups", json={"name": "Choir"}, headers=lead)).json()
+    youth = (await client.post("/api/v1/groups", json={"name": "Youth"}, headers=lead)).json()
+    unrelated = (await client.post("/api/v1/groups", json={"name": "Ushers"}, headers=lead)).json()
+
+    # Leah leads both choir and youth — she's the collision's whole point.
+    await client.post(
+        f"/api/v1/groups/{choir['id']}/members",
+        json={"member_ids": [leah_member["id"]], "role": "leader"},
+        headers=lead,
+    )
+    await client.post(
+        f"/api/v1/groups/{youth['id']}/members",
+        json={"member_ids": [leah_member["id"]], "role": "leader"},
+        headers=lead,
+    )
+    mine = (await client.get("/api/v1/me/groups", headers=leah_h)).json()
+    for g in mine:
+        await client.post(f"/api/v1/me/groups/invitations/{g['membership_id']}", json={"accept": True}, headers=leah_h)
+    # bystander is in both groups too (counts toward "affected"); outsider is
+    # only in the unrelated group (never shows up in either count).
+    await client.post(
+        f"/api/v1/groups/{choir['id']}/members", json={"member_ids": [bystander["id"]], "role": "member"}, headers=lead
+    )
+    await client.post(
+        f"/api/v1/groups/{youth['id']}/members", json={"member_ids": [bystander["id"]], "role": "member"}, headers=lead
+    )
+    await client.post(
+        f"/api/v1/groups/{unrelated['id']}/members",
+        json={"member_ids": [outsider["id"]], "role": "member"},
+        headers=lead,
+    )
+
+    start = (datetime.now(UTC) + timedelta(days=5)).replace(microsecond=0)
+    choir_event = (
+        await client.post(
+            "/api/v1/events",
+            json={
+                "title": "Choir practice",
+                "type": "meeting",
+                "group_id": choir["id"],
+                "start_date_time": start.isoformat(),
+                "end_date_time": (start + timedelta(hours=2)).isoformat(),
+            },
+            headers=lead,
+        )
+    ).json()
+    # Overlaps by 30 minutes.
+    youth_start = start + timedelta(hours=1, minutes=30)
+    youth_event = (
+        await client.post(
+            "/api/v1/events",
+            json={
+                "title": "Youth night",
+                "type": "meeting",
+                "group_id": youth["id"],
+                "start_date_time": youth_start.isoformat(),
+                "end_date_time": (youth_start + timedelta(hours=2)).isoformat(),
+            },
+            headers=lead,
+        )
+    ).json()
+    # Ushers meets at the exact same time as choir, but shares no members — no collision.
+    await client.post(
+        "/api/v1/events",
+        json={
+            "title": "Ushers briefing",
+            "type": "meeting",
+            "group_id": unrelated["id"],
+            "start_date_time": start.isoformat(),
+            "end_date_time": (start + timedelta(hours=1)).isoformat(),
+        },
+        headers=lead,
+    )
+
+    collisions = await client.post(
+        "/api/v1/events/collisions",
+        json={
+            "group_id": youth["id"],
+            "start_date_time": youth_event["start_date_time"],
+            "end_date_time": youth_event["end_date_time"],
+            "exclude_event_id": youth_event["id"],
+        },
+        headers=lead,
+    )
+    assert collisions.status_code == 200, collisions.text
+    found = collisions.json()
+    assert [c["event_id"] for c in found] == [choir_event["id"]]
+    assert found[0]["affected_member_count"] == 2  # Leah + bystander, not outsider
+    assert [kp["member_id"] for kp in found[0]["key_participants"]] == [leah_member["id"]]
+
+    notified = await client.post(
+        "/api/v1/events/notify-conflict",
+        json={
+            "event_id": youth_event["id"],
+            "colliding_event_id": choir_event["id"],
+            "member_ids": [leah_member["id"]],
+        },
+        headers=lead,
+    )
+    assert notified.status_code == 200 and notified.json() == 1
+
+    async with platform_session() as db:
+        rows = await db.query_raw(
+            "select title, body, action_url from notifications where tenant_id = $1::uuid and user_id = $2::uuid",
+            tenant_id,
+            leah["user"]["id"],
+        )
+        assert len(rows) == 1
+        assert "Choir practice" in rows[0]["body"] and "Youth night" in rows[0]["body"]
+
+
+# ───────────────────────────── Registration forms ─────────────────────────────
+
+
+async def test_event_registration_fields_and_public_signup(client, church_payload):
+    """Attach custom questions to an event, publish it, and let an anonymous
+    visitor answer them through the public share link — welcoming, not
+    interrogating: nothing here requires a login to RSVP."""
+    _, leader, lead = await _church(client, church_payload, "forms")
+    slug = (await client.get("/api/v1/org/profile", headers=lead)).json()["slug"]
+
+    start = (datetime.now(UTC) + timedelta(days=3)).replace(microsecond=0)
+    event = (
+        await client.post(
+            "/api/v1/events",
+            json={"title": "Youth Camp", "type": "event", "start_date_time": start.isoformat(), "visibility": "public"},
+            headers=lead,
+        )
+    ).json()
+    assert (await client.post(f"/api/v1/events/{event['id']}/publish", headers=lead)).status_code == 200
+
+    assert (await client.get(f"/api/v1/events/{event['id']}/fields", headers=lead)).json() == []
+
+    fields = await client.put(
+        f"/api/v1/events/{event['id']}/fields",
+        json={
+            "fields": [
+                {
+                    "label": "T-shirt size",
+                    "field_type": "single_choice",
+                    "options": ["S", "M", "L"],
+                    "required": True,
+                },
+                {"label": "Dietary notes", "field_type": "text", "required": False},
+                {
+                    "label": "Allergies",
+                    "field_type": "checkbox",
+                    "options": ["Nuts", "Dairy", "Gluten"],
+                    "required": False,
+                },
+            ]
+        },
+        headers=lead,
+    )
+    assert fields.status_code == 200, fields.text
+    assert [f["label"] for f in fields.json()] == ["T-shirt size", "Dietary notes", "Allergies"]
+
+    # The public share link shows the questions before anyone RSVPs — no auth.
+    detail = await client.get(f"/api/v1/churches/{slug}/events/{event['id']}")
+    assert detail.status_code == 200, detail.text
+    assert [f["label"] for f in detail.json()["registration_fields"]] == ["T-shirt size", "Dietary notes", "Allergies"]
+
+    # A required question left blank is rejected.
+    missing = await client.post(
+        f"/api/v1/churches/{slug}/events/{event['id']}/register",
+        json={"respondent_name": "Casey Visitor", "answers": {}},
+    )
+    assert missing.status_code == 400
+
+    submitted = await client.post(
+        f"/api/v1/churches/{slug}/events/{event['id']}/register",
+        json={
+            "respondent_name": "Casey Visitor",
+            "respondent_email": "casey@example.com",
+            "answers": {"T-shirt size": "M", "Allergies": ["Nuts"]},
+        },
+    )
+    assert submitted.status_code == 201, submitted.text
+
+    # Staff running the event see it in the responses tab.
+    responses = await client.get(f"/api/v1/events/{event['id']}/responses", headers=lead)
+    assert responses.status_code == 200
+    assert len(responses.json()) == 1
+    row = responses.json()[0]
+    assert row["respondent_name"] == "Casey Visitor"
+    assert row["answers"]["T-shirt size"] == "M" and row["answers"]["Allergies"] == ["Nuts"]
+
+    # Editing the form afterward doesn't corrupt what was already collected —
+    # answers are snapshotted by label, not tied back to the field row.
+    await client.put(f"/api/v1/events/{event['id']}/fields", json={"fields": []}, headers=lead)
+    still_there = (await client.get(f"/api/v1/events/{event['id']}/responses", headers=lead)).json()
+    assert still_there[0]["answers"]["T-shirt size"] == "M"

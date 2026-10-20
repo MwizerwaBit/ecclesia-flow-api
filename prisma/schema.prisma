@@ -136,6 +136,22 @@ model PasswordResetToken {
   @@map("password_reset_tokens")
 }
 
+// One row per MFA challenge token (its jti), so the same challenge can't be
+// replayed with different codes beyond a capped number of attempts, and
+// can't be reused at all once it succeeds. Like refresh_tokens: account-level,
+// not tenant data, so no RLS (SA-10 — MFA challenge tokens are single-use).
+model MfaChallengeAttempt {
+  id            String    @id @default(uuid()) @db.Uuid
+  jti           String    @unique
+  user_id       String    @db.Uuid
+  attempt_count Int       @default(0)
+  consumed_at   DateTime? @db.Timestamptz(6)
+  expires_at    DateTime  @db.Timestamptz(6)
+  created_at    DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("mfa_challenge_attempts")
+}
+
 // ───────────────────────────── RBAC + ABAC ─────────────────────────────
 
 model Role {
@@ -269,6 +285,13 @@ model Member {
   national_id_hash               String?
   national_id_encrypted          String?
   national_id_last4              String?
+  // Pastoral follow-up (a visitor who hasn't been reached, a member not seen
+  // recently): who is on it, and whether it's done. Reusable across both —
+  // only the visitor-followups screen writes to it today.
+  followup_assigned_to_user_id String?   @db.Uuid
+  followup_assigned_at         DateTime? @db.Timestamptz(6)
+  followup_resolved_at         DateTime? @db.Timestamptz(6)
+  followup_note                String?
   created_at                 DateTime  @default(now()) @db.Timestamptz(6)
   updated_at                 DateTime  @updatedAt @db.Timestamptz(6)
 
@@ -888,6 +911,37 @@ model EventReview {
 
   @@unique([event_id, reviewer_user_id])
   @@map("event_reviews")
+}
+
+// Custom registration questions attached to an event, shown on its public
+// share link before someone RSVPs. Answers are captured against the field's
+// label at submission time (see EventRegistration.answers), not a field id,
+// so editing or removing a question later never corrupts an existing response.
+model EventRegistrationField {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  event_id   String   @db.Uuid
+  label      String
+  field_type String // 'text' | 'single_choice' | 'checkbox'
+  options    String[] @default([])
+  required   Boolean  @default(false)
+  position   Int
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("event_registration_fields")
+}
+
+model EventRegistration {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenant_id        String   @db.Uuid
+  event_id         String   @db.Uuid
+  respondent_name  String
+  respondent_email String?
+  respondent_phone String?
+  answers          Json     @default("{}")
+  created_at       DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("event_registrations")
 }
 
 // ───────────────────────────── Organisation structure ─────────────────────────────

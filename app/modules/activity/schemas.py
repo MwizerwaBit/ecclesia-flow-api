@@ -213,3 +213,100 @@ class PublicEvent(BaseModel):
     is_recurring: bool
     cover_image_url: str | None
     theme: EventTheme
+
+
+# ───────────────────────────── Schedule collisions ─────────────────────────────
+
+
+class CollisionCheckInput(BaseModel):
+    group_id: str
+    start_date_time: datetime
+    end_date_time: datetime | None = None
+    #: Set when checking an event that already exists, so it doesn't collide with itself.
+    exclude_event_id: str | None = None
+
+
+class KeyParticipant(BaseModel):
+    member_id: str
+    name: str
+    role_name: str
+    #: Which of the two groups in conflict they lead.
+    group_name: str
+
+
+class EventCollision(BaseModel):
+    event_id: str
+    event_title: str
+    group_id: str
+    group_name: str
+    start_date_time: datetime
+    end_date_time: datetime | None
+    #: People in both groups — an approximation: it counts shared group
+    #: membership, not RSVPs, since nothing here tracks who actually intends
+    #: to come to either gathering.
+    affected_member_count: int
+    #: Group leaders among the affected members — the people this scheduling
+    #: clash actually costs something, since they're expected to lead one of
+    #: the two gatherings.
+    key_participants: list[KeyParticipant]
+
+
+class NotifyKeyParticipantsInput(BaseModel):
+    event_id: str
+    colliding_event_id: str
+    member_ids: list[str]
+
+
+# ───────────────────────────── Registration forms ─────────────────────────────
+
+RegistrationFieldType = Literal["text", "single_choice", "checkbox"]
+FieldLabel = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
+FieldOption = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
+
+
+class RegistrationFieldInput(BaseModel):
+    label: FieldLabel
+    field_type: RegistrationFieldType
+    options: list[FieldOption] = Field(default_factory=list, max_length=20)
+    required: bool = False
+
+    @model_validator(mode="after")
+    def _choice_types_need_options(self):
+        if self.field_type in ("single_choice", "checkbox") and not self.options:
+            raise ValueError("Choice fields need at least one option")
+        if self.field_type == "text" and self.options:
+            raise ValueError("Text fields don't take options")
+        return self
+
+
+class RegistrationFieldRead(RegistrationFieldInput):
+    id: str
+    position: int
+
+
+class SetRegistrationFieldsInput(BaseModel):
+    #: The whole form, in display order — replaces whatever was there before.
+    fields: list[RegistrationFieldInput] = Field(default_factory=list, max_length=30)
+
+
+class PublicEventDetail(PublicEvent):
+    registration_fields: list[RegistrationFieldRead]
+
+
+class EventRegistrationInput(BaseModel):
+    respondent_name: Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
+    respondent_email: Annotated[str, StringConstraints(max_length=320)] | None = None
+    respondent_phone: Annotated[str, StringConstraints(max_length=40)] | None = None
+    #: Keyed by the field's label, not its id — see EventRegistrationField in
+    #: schema.prisma for why. Value is a string for text/single_choice, a
+    #: list of strings for checkbox.
+    answers: dict[str, str | list[str]] = Field(default_factory=dict)
+
+
+class EventRegistrationRead(BaseModel):
+    id: str
+    respondent_name: str
+    respondent_email: str | None
+    respondent_phone: str | None
+    answers: dict[str, str | list[str]]
+    created_at: datetime

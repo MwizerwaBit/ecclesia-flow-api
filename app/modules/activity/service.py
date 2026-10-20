@@ -4,13 +4,15 @@ from datetime import UTC, datetime, timedelta
 from prisma import Json, Prisma
 
 from app.core.database import set_tenant_context
-from app.core.exceptions import ConflictError, NotFoundError
+from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.modules.activity import recurrence, repository
 from app.modules.activity.schemas import (
     AttendanceMarkInput,
     ChurchEventCreate,
     ChurchEventUpdate,
+    CollisionCheckInput,
     HeadcountEntry,
+    NotifyKeyParticipantsInput,
 )
 from app.modules.audit.service import write_audit
 from app.modules.groups import service as groups_service
@@ -308,3 +310,111 @@ async def submit_headcount(db: Prisma, tenant_id: str, marked_by_user_id: str, p
         total=payload.total,
         marked_by_user_id=marked_by_user_id,
     )
+
+
+# ───────────────────────────── Schedule collisions ─────────────────────────────
+
+
+async def check_collisions(db: Prisma, payload: CollisionCheckInput) -> list[dict]:
+    if not await groups_service.group_exists(db, payload.group_id):
+        raise NotFoundError("No such group")
+    end = payload.end_date_time or (payload.start_date_time + timedelta(hours=2))
+    rows = await repository.find_colliding_events(
+        db, group_id=payload.group_id, start=payload.start_date_time, end=end, exclude_event_id=payload.exclude_event_id
+    )
+    out = []
+    for r in rows:
+        candidates = await repository.key_participants_for(db, group_ids=[payload.group_id, r["group_id"]])
+        # Someone leading both colliding groups appears once per group here —
+        # they're still one person to ask, not two.
+        key_participants = list({c["member_id"]: c for c in candidates}.values())
+        out.append({**r, "key_participants": key_participants})
+    return out
+
+
+async def notify_key_participants(db: Prisma, tenant_id: str, payload: NotifyKeyParticipantsInput) -> int:
+    """Only reaches people who actually have a login — a leader without one
+    needs a phone call or a word after service, not a silent no-op, so the
+    count returned is who it actually reached, not who was asked to be."""
+    event = await repository.get_event(db, payload.event_id)
+    colliding = await repository.get_event(db, payload.colliding_event_id)
+    if event is None or colliding is None:
+        raise NotFoundError("No such gathering")
+
+    candidates = await repository.key_participants_for(db, group_ids=[event.group_id, colliding.group_id])
+    wanted = set(payload.member_ids)
+    # A person leading both colliding groups appears once per group here —
+    # dedupe by user, so they get one notification, not two identical ones.
+    notifiable = list({c["user_id"]: c for c in candidates if c["member_id"] in wanted and c["user_id"]}.values())
+
+    event_group = await groups_service.get_group_record(db, event.group_id)
+    colliding_group = await groups_service.get_group_record(db, colliding.group_id)
+    when_a = event.start_date_time.strftime("%a %d %b, %H:%M")
+    when_b = colliding.start_date_time.strftime("%a %d %b, %H:%M")
+    body = (
+        f'Two gatherings you\'re tied to overlap: "{event.title}" ({when_a}, {event_group.name}) and '
+        f'"{colliding.title}" ({when_b}, {colliding_group.name}). Let both group leaders know which one '
+        "you'll be at."
+    )
+    rows = [
+        {
+            "tenant_id": tenant_id,
+            "user_id": c["user_id"],
+            # "notifications_type_check" only allows pastoral_alert/finance_alert/
+            # system/announcement — a dedicated "schedule_conflict" type would
+            # need its own migration and a notification-preferences entry,
+            # which is more than this warranted; "system" is the closest fit.
+            "type": "system",
+            "title": "Scheduling clash — which will you attend?",
+            "body": body,
+            "action_url": f"/staff/events/{event.id}",
+        }
+        for c in notifiable
+    ]
+    await repository.create_notifications(db, rows)
+    return len(rows)
+
+
+# ───────────────────────────── Registration forms ─────────────────────────────
+
+
+async def get_registration_fields(db: Prisma, event_id: str) -> list[dict]:
+    return await repository.list_registration_fields(db, event_id)
+
+
+async def set_registration_fields(db: Prisma, tenant_id: str, event_id: str, fields: list[dict]) -> list[dict]:
+    return await repository.replace_registration_fields(db, tenant_id, event_id, fields)
+
+
+async def list_registrations(db: Prisma, event_id: str) -> list[dict]:
+    return await repository.list_registrations(db, event_id)
+
+
+async def public_event_detail(db: Prisma, slug: str, event_id: str) -> dict:
+    org = await tenant_service.get_live_org_by_slug(db, slug)
+    await set_tenant_context(db, org.id)
+    row = await repository.get_public_event_row(db, event_id)
+    if row is None:
+        raise NotFoundError("No such gathering")
+    decorated = _decorate(row)
+    decorated["registration_fields"] = await repository.list_registration_fields(db, event_id)
+    return decorated
+
+
+async def submit_registration(db: Prisma, slug: str, event_id: str, payload: dict) -> dict:
+    org = await tenant_service.get_live_org_by_slug(db, slug)
+    await set_tenant_context(db, org.id)
+    if await repository.get_public_event_row(db, event_id) is None:
+        raise NotFoundError("No such gathering")
+    fields = await repository.list_registration_fields(db, event_id)
+    answers = payload.get("answers") or {}
+    for field in fields:
+        if not field["required"]:
+            continue
+        value = answers.get(field["label"])
+        empty = (
+            value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, list) and not value)
+        )
+        if empty:
+            raise AppError(f'"{field["label"]}" is required')
+    return await repository.create_registration(db, org.id, event_id, payload)

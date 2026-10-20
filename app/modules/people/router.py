@@ -20,6 +20,7 @@ from app.core.exceptions import NotFoundError
 from app.core.pagination import PaginatedRoute
 from app.modules.people import service
 from app.modules.people.schemas import (
+    AssignFollowUpInput,
     HouseholdRead,
     MemberCreate,
     MemberDetail,
@@ -28,6 +29,7 @@ from app.modules.people.schemas import (
     PastoralNoteCreate,
     PastoralNoteRead,
     PossibleDuplicate,
+    ResolveFollowUpInput,
     SacramentalRecordCreate,
     SacramentalRecordRead,
     VisitorFollowUp,
@@ -94,6 +96,38 @@ async def list_visitor_followups(db: TenantDb, scope: CurrentScope):
     rows = await service.list_visitor_followups(db)
     visible = set(await ensure_members_visible(db, scope, [r["member_id"] for r in rows]))
     return [r for r in rows if r["member_id"] in visible]
+
+
+@router.post(
+    "/{member_id}/followup/assign", status_code=204, dependencies=[Depends(require_permission("members:update"))]
+)
+async def assign_followup(member_id: str, payload: AssignFollowUpInput, scope: CurrentScope, db: TenantDb):
+    await ensure_member_writable(db, scope, member_id)
+    await service.assign_followup(db, member_id, payload.assigned_to_user_id)
+
+
+@router.delete(
+    "/{member_id}/followup/assign", status_code=204, dependencies=[Depends(require_permission("members:update"))]
+)
+async def unassign_followup(member_id: str, scope: CurrentScope, db: TenantDb):
+    await ensure_member_writable(db, scope, member_id)
+    await service.unassign_followup(db, member_id)
+
+
+@router.post(
+    "/{member_id}/followup/resolve", status_code=204, dependencies=[Depends(require_permission("members:update"))]
+)
+async def resolve_followup(member_id: str, payload: ResolveFollowUpInput, scope: CurrentScope, db: TenantDb):
+    await ensure_member_writable(db, scope, member_id)
+    await service.resolve_followup(db, member_id, payload.note)
+
+
+@router.post(
+    "/{member_id}/followup/reopen", status_code=204, dependencies=[Depends(require_permission("members:update"))]
+)
+async def reopen_followup(member_id: str, scope: CurrentScope, db: TenantDb):
+    await ensure_member_writable(db, scope, member_id)
+    await service.reopen_followup(db, member_id)
 
 
 @router.post(

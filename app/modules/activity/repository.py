@@ -1,4 +1,4 @@
-from prisma import Prisma
+from prisma import Json, Prisma
 from prisma.models import AttendanceRecord, Event
 
 _LIST_COLUMNS = """
@@ -218,3 +218,129 @@ async def record_review_decision(db: Prisma, review_id: str, data: dict) -> None
 
 async def count_reviews_not_approved(db: Prisma, event_id: str) -> int:
     return await db.eventreview.count(where={"event_id": event_id, "status": {"not": "approved"}})
+
+
+# ── Schedule collisions ──────────────────────────────────────────────────
+# A gathering's own group isn't scheduled against the rest of the church —
+# only against OTHER groups' gatherings, since that's the actual conflict: a
+# person in two groups can't be at both. An event with no end time is given a
+# 2-hour window for this check only; it isn't written back anywhere.
+
+
+async def find_colliding_events(
+    db: Prisma, *, group_id: str, start: object, end: object, exclude_event_id: str | None
+) -> list[dict]:
+    return await db.query_raw(
+        """
+        with my_members as (
+            select member_id from group_memberships where group_id = $1::uuid and status = 'active'
+        ),
+        candidates as (
+            select e.id, e.title, e.group_id, g.name as group_name, e.start_date_time, e.end_date_time
+            from events e
+            join groups g on g.id = e.group_id
+            where e.group_id is not null
+              and e.group_id != $1::uuid
+              and e.status != 'canceled'
+              and ($4::uuid is null or e.id != $4::uuid)
+              and e.start_date_time < $3::timestamptz
+              and coalesce(e.end_date_time, e.start_date_time + interval '2 hours') > $2::timestamptz
+        )
+        select c.id as event_id, c.title as event_title, c.group_id, c.group_name,
+               c.start_date_time, c.end_date_time, count(distinct gm.member_id) as affected_member_count
+        from candidates c
+        join group_memberships gm on gm.group_id = c.group_id and gm.status = 'active'
+        join my_members mm on mm.member_id = gm.member_id
+        group by c.id, c.title, c.group_id, c.group_name, c.start_date_time, c.end_date_time
+        order by c.start_date_time
+        """,
+        group_id,
+        start,
+        end,
+        exclude_event_id,
+    )
+
+
+async def key_participants_for(db: Prisma, *, group_ids: list[str]) -> list[dict]:
+    """Leaders (rank 0) of either group, among members who belong to both —
+    the caller passes exactly the two colliding groups' ids and the
+    intersection is computed here, so this only ever returns people the
+    clash actually affects, not every leader of either group."""
+    return await db.query_raw(
+        """
+        with shared_members as (
+            select member_id
+            from group_memberships
+            where group_id = any($1::uuid[]) and status = 'active'
+            group by member_id
+            having count(distinct group_id) = 2
+        )
+        select m.id as member_id, m.user_id, (m.first_name || ' ' || m.last_name) as name,
+               gr.name as role_name, g.name as group_name
+        from group_memberships gm
+        join shared_members sm on sm.member_id = gm.member_id
+        join members m on m.id = gm.member_id
+        join groups g on g.id = gm.group_id
+        join group_roles gr on gr.tenant_id = gm.tenant_id and gr.key = gm.role
+        where gm.group_id = any($1::uuid[]) and gm.status = 'active' and gr.rank = 0
+        """,
+        group_ids,
+    )
+
+
+async def create_notifications(db: Prisma, rows: list[dict]) -> None:
+    for row in rows:
+        await db.notification.create(data=row)
+
+
+# ── Registration forms ──────────────────────────────────────────────────
+
+
+async def list_registration_fields(db: Prisma, event_id: str) -> list[dict]:
+    rows = await db.eventregistrationfield.find_many(where={"event_id": event_id}, order={"position": "asc"})
+    return [r.model_dump() for r in rows]
+
+
+async def replace_registration_fields(db: Prisma, tenant_id: str, event_id: str, fields: list[dict]) -> list[dict]:
+    """Full replace: the caller always sends the whole form in display order.
+    Safe because responses snapshot each field's label at submission time
+    rather than pointing back at this row (see EventRegistrationField).
+
+    Runs directly on the request's own transaction rather than opening a
+    nested one — ``db`` here is already inside ``tenant_session``'s
+    transaction, and a second ``db.tx()`` on top of it put inserts outside
+    the scope where the RLS session variable is visible, tripping
+    ``tenant_isolation``'s WITH CHECK."""
+    await db.eventregistrationfield.delete_many(where={"event_id": event_id})
+    created = []
+    for position, field in enumerate(fields):
+        row = await db.eventregistrationfield.create(
+            data={**field, "tenant_id": tenant_id, "event_id": event_id, "position": position}
+        )
+        created.append(row.model_dump())
+    return created
+
+
+async def get_public_event_row(db: Prisma, event_id: str) -> dict | None:
+    rows = await db.query_raw(
+        """
+        select e.id, e.title, e.type, e.description, e.location, e.online_url, e.start_date_time, e.end_date_time,
+               e.is_recurring, e.recurrence_rule, e.cover_image_url, e.theme
+        from events e
+        where e.id = $1::uuid and e.status = 'published' and e.visibility = 'public'
+        """,
+        event_id,
+    )
+    return rows[0] if rows else None
+
+
+async def create_registration(db: Prisma, tenant_id: str, event_id: str, data: dict) -> dict:
+    row = await db.eventregistration.create(
+        data={**data, "answers": Json(data["answers"]), "tenant_id": tenant_id, "event_id": event_id}
+    )
+    return row.model_dump()
+
+
+async def list_registrations(db: Prisma, event_id: str) -> list[dict]:
+    rows = await db.eventregistration.find_many(where={"event_id": event_id}, order={"created_at": "desc"})
+    return [r.model_dump() for r in rows]

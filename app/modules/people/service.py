@@ -285,6 +285,10 @@ async def quick_add_visitor(
             "last_name": payload.last_name,
             "phone": payload.phone,
             "status": "visitor",
+            # The day they walked in — also what the visitor-followups queue
+            # sorts and ages by; without it that endpoint 500s on this row
+            # (visit_date is a required field in its response).
+            "joined_at": datetime.now(UTC).date(),
             **({"unit_id": unit_id} if unit_id else {}),
         },
     )
@@ -345,6 +349,14 @@ async def create_sacramental_record(db: Prisma, *, tenant_id: str, member_id: st
     )
 
 
+def _followup_status(r: dict) -> str:
+    if r["followup_resolved_at"] is not None:
+        return "resolved"
+    if r["followup_assigned_to_user_id"] is not None:
+        return "assigned"
+    return "pending"
+
+
 async def list_visitor_followups(db: Prisma) -> list[dict]:
     rows = await repository.list_visitor_followups(db)
     out = []
@@ -367,13 +379,39 @@ async def list_visitor_followups(db: Prisma) -> list[dict]:
                 },
                 "days_since_visit": r["days_since_visit"] or 0,
                 "visit_date": r["visit_date"],
-                "assigned_to_id": None,
-                "assigned_to_name": None,
-                "status": "pending",
-                "notes": None,
+                "assigned_to_id": r["followup_assigned_to_user_id"],
+                "assigned_to_name": r["followup_assigned_to_name"],
+                "status": _followup_status(r),
+                "notes": r["followup_note"],
             }
         )
     return out
+
+
+async def assign_followup(db: Prisma, member_id: str, assigned_to_user_id: str) -> None:
+    if await repository.get_member(db, member_id) is None:
+        raise NotFoundError("No such member")
+    if not await repository.user_is_active_team_member(db, assigned_to_user_id):
+        raise ConflictError("That person isn't an active team member here", code="not_a_team_member")
+    await repository.assign_followup(db, member_id, assigned_to_user_id=assigned_to_user_id)
+
+
+async def unassign_followup(db: Prisma, member_id: str) -> None:
+    if await repository.get_member(db, member_id) is None:
+        raise NotFoundError("No such member")
+    await repository.unassign_followup(db, member_id)
+
+
+async def resolve_followup(db: Prisma, member_id: str, note: str | None) -> None:
+    if await repository.get_member(db, member_id) is None:
+        raise NotFoundError("No such member")
+    await repository.resolve_followup(db, member_id, note=note)
+
+
+async def reopen_followup(db: Prisma, member_id: str) -> None:
+    if await repository.get_member(db, member_id) is None:
+        raise NotFoundError("No such member")
+    await repository.reopen_followup(db, member_id)
 
 
 async def get_member_record(db: Prisma, member_id: str):
