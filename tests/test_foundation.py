@@ -222,6 +222,80 @@ async def test_database_enforces_unit_scope_without_the_application(client, chur
         assert {r["id"] for r in await tx.query_raw("select id from members")} == {east_person, west_person}
 
 
+async def test_database_enforces_unit_scope_for_groups_events_and_attendance(client, church_payload):
+    """Same backstop as members, for the Phase 3 gap (SA-05): groups, events
+    and attendance now carry a unit-scope policy too. unit_id is nullable on
+    both groups and events (NULL = church-wide, visible to every branch but
+    writable only by a whole-church session) — the two directions are
+    exercised separately below."""
+    _, session, lead, root = await _church(client, church_payload, "rls-groups")
+    tenant_id, user_id = session["active_membership"]["tenant_id"], session["user"]["id"]
+    east = await _unit(client, lead, "East", root)
+    west = await _unit(client, lead, "West", root)
+    west_person = await _member(client, lead, "Westy", west)
+
+    shared_group = await client.post("/api/v1/groups", json={"name": "Choir"}, headers=lead)
+    assert shared_group.status_code == 201, shared_group.text
+    shared_group_id = shared_group.json()["id"]
+    west_group = await client.post("/api/v1/groups", json={"name": "West Youth", "unit_id": west}, headers=lead)
+    assert west_group.status_code == 201, west_group.text
+    west_group_id = west_group.json()["id"]
+
+    shared_event = await client.post(
+        "/api/v1/events",
+        json={"title": "Sunday Service", "type": "service", "start_date_time": "2026-11-01T09:00:00Z"},
+        headers=lead,
+    )
+    assert shared_event.status_code == 200, shared_event.text
+    shared_event_id = shared_event.json()["id"]
+    west_event = await client.post(
+        "/api/v1/events",
+        json={
+            "title": "West Prayer Night",
+            "type": "prayer",
+            "start_date_time": "2026-11-02T18:00:00Z",
+            "unit_id": west,
+        },
+        headers=lead,
+    )
+    assert west_event.status_code == 200, west_event.text
+    west_event_id = west_event.json()["id"]
+
+    marked = await client.post(
+        f"/api/v1/events/{west_event_id}/attendance", json={"member_id": west_person}, headers=lead
+    )
+    assert marked.status_code == 200, marked.text
+
+    async with tenant_session(tenant_id, user_id, unit_scope_id=east) as tx:
+        # Church-wide rows are visible from any branch; the other branch's
+        # own group/event/attendance are not.
+        assert {r["id"] for r in await tx.query_raw("select id from groups")} == {shared_group_id}
+        assert {r["id"] for r in await tx.query_raw("select id from events")} == {shared_event_id}
+        assert await tx.query_raw("select id from attendance_records") == []
+
+        # Writes to the other branch's group touch nothing...
+        assert await tx.execute_raw("update groups set name = 'x' where id = $1::uuid", west_group_id) == 0
+        # ...and an insert into the other branch is rejected outright, not
+        # just filtered away.
+        with pytest.raises(PrismaError):
+            await tx.execute_raw(
+                "insert into groups (id, tenant_id, name, unit_id) values (gen_random_uuid(), $1::uuid, 'x', $2::uuid)",
+                tenant_id,
+                west,
+            )
+        # A scoped session can't create a church-wide (unit_id null) record
+        # either — only whole-church staff may.
+        with pytest.raises(PrismaError):
+            await tx.execute_raw(
+                "insert into groups (id, tenant_id, name, unit_id) values (gen_random_uuid(), $1::uuid, 'x', null)",
+                tenant_id,
+            )
+
+    async with tenant_session(tenant_id, user_id) as tx:
+        assert {r["id"] for r in await tx.query_raw("select id from groups")} == {shared_group_id, west_group_id}
+        assert {r["id"] for r in await tx.query_raw("select id from events")} == {shared_event_id, west_event_id}
+
+
 # ───────────────────────────── Unit memberships ─────────────────────────────
 
 

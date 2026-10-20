@@ -353,17 +353,40 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
     return session
 
 
-async def _fail_login(user: User | None) -> None:
+async def _fail_login(user: User | None, *, ip_address: str | None = None) -> None:
     """Records a failure in its OWN transaction: the request's transaction
     rolls back when we raise, which would otherwise erase the count and make
-    the lockout unreachable (same reasoning as refresh-reuse revocation)."""
+    the lockout unreachable (same reasoning as refresh-reuse revocation).
+
+    Audited at the account level (``tenant_id=None``, ``actor_user_id=None``):
+    nobody has proven they are this user yet, so the entry names the target
+    account as the resource, not the actor (SA-12)."""
     if user is None:
         return
     settings = get_settings()
     async with independent_transaction() as tx:
-        await repository.record_failed_login(
+        locked = await repository.record_failed_login(
             tx, user.id, max_failures=settings.max_failed_logins, lockout_minutes=settings.lockout_minutes
         )
+        await write_audit(
+            tx,
+            tenant_id=None,
+            actor_user_id=None,
+            action="auth.login_failed",
+            resource_type="user",
+            resource_id=user.id,
+            ip_address=ip_address,
+        )
+        if locked:
+            await write_audit(
+                tx,
+                tenant_id=None,
+                actor_user_id=None,
+                action="auth.account_locked",
+                resource_type="user",
+                resource_id=user.id,
+                ip_address=ip_address,
+            )
 
 
 def _locked(user: User) -> bool:
@@ -388,7 +411,7 @@ async def authenticate(
     # Constant-shape failure: a wrong password and a nonexistent email return
     # the identical error, so the endpoint can't be used to enumerate accounts.
     if not password_ok:
-        await _fail_login(user)
+        await _fail_login(user, ip_address=ip_address)
         raise UnauthorizedError("Incorrect email or password")
     if user.status != "active":
         raise ForbiddenError("This account is not active")
@@ -429,12 +452,33 @@ async def complete_mfa_challenge(
     if _locked(user):
         raise AccountLockedError("Too many failed sign-in attempts. Try again later.", locked_until=user.locked_until)
 
+    # Single-use, capped-attempt (SA-10): claimed before the code is even
+    # checked, so a replayed or exhausted token is rejected regardless of
+    # whether the attacker happens to guess right. In its OWN transaction —
+    # same reasoning as _fail_login: this call is usually followed by a
+    # raise, which would otherwise roll the claim back and make the token
+    # replayable forever.
+    settings = get_settings()
+    async with independent_transaction() as tx:
+        attempt = await repository.claim_mfa_attempt(
+            tx, jti=payload["jti"], user_id=user.id, expires_at=datetime.fromtimestamp(payload["exp"], tz=UTC)
+        )
+        if attempt is not None and attempt > settings.mfa_challenge_max_attempts:
+            await repository.burn_mfa_attempt(tx, payload["jti"])
+    if attempt is None:
+        raise UnauthorizedError(
+            "This verification attempt is no longer valid — sign in again", code="mfa_challenge_invalid"
+        )
+    if attempt > settings.mfa_challenge_max_attempts:
+        raise UnauthorizedError("Too many attempts — sign in again for a new code", code="mfa_challenge_invalid")
+
     if not await _verify_code_or_backup(db, user, code):
         # Wrong second-factor codes count toward the same lockout, so a stolen
         # password can't be paired with unlimited TOTP guesses.
-        await _fail_login(user)
+        await _fail_login(user, ip_address=ip_address)
         raise UnauthorizedError("Incorrect verification code")
 
+    await repository.burn_mfa_attempt(db, payload["jti"])
     await repository.clear_failed_logins(db, user.id)
     memberships = await _membership_summaries(db, user.id)
     primary = next((m for m in memberships if m.is_primary), memberships[0] if memberships else None)
@@ -591,7 +635,7 @@ async def accept_invite(
         raise UnauthorizedError("This invitation link is not valid")
     if user.password_hash:
         if not verify_password(password, user.password_hash):
-            await _fail_login(user)
+            await _fail_login(user, ip_address=ip_address)
             raise UnauthorizedError("Incorrect password for your existing account")
     else:
         await repository.set_password(

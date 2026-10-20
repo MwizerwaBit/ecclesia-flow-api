@@ -243,3 +243,38 @@ async def set_password(db: Prisma, user_id: str, *, password_hash: str, first_na
         first_name,
         last_name,
     )
+
+
+# ───────────────────────────── MFA challenge attempts ─────────────────────────────
+
+
+async def claim_mfa_attempt(db: Prisma, *, jti: str, user_id: str, expires_at: datetime) -> int | None:
+    """One row per challenge token's jti, created on its first use and
+    incremented on every retry — atomically, so two concurrent requests for
+    the same token can't both squeeze through. Returns the attempt count
+    this call bumped it to, or None if the token was already consumed (by a
+    success or by a previous call that burned it for too many attempts) —
+    the caller can't tell those two apart from this alone, which is fine:
+    either way the token is dead."""
+    rows = await db.query_raw(
+        """
+        insert into mfa_challenge_attempts (id, jti, user_id, attempt_count, expires_at)
+        values (gen_random_uuid(), $1, $2::uuid, 1, $3::timestamptz)
+        on conflict (jti) do update
+          set attempt_count = mfa_challenge_attempts.attempt_count + 1
+          where mfa_challenge_attempts.consumed_at is null
+        returning attempt_count
+        """,
+        jti,
+        user_id,
+        expires_at,
+    )
+    return rows[0]["attempt_count"] if rows else None
+
+
+async def burn_mfa_attempt(db: Prisma, jti: str) -> None:
+    """Consumes the token for good — on success, or once claim_mfa_attempt
+    reports too many tries, so it can't be retried even within its window."""
+    await db.execute_raw(
+        "update mfa_challenge_attempts set consumed_at = now() where jti = $1 and consumed_at is null", jti
+    )

@@ -71,4 +71,4 @@ async def approve_leadership_transfer(transfer_id: str, claims: CurrentClaims, d
 
 @router.delete("/leadership-transfer/{transfer_id}", status_code=204, dependencies=[Depends(require_step_up)])
 async def cancel_leadership_transfer(transfer_id: str, claims: CurrentClaims, db: TenantDb):
-    await service.cancel_leadership_transfer(db, transfer_id, claims.sub)
+    await service.cancel_leadership_transfer(db, claims.tenant_id, transfer_id, claims.sub)

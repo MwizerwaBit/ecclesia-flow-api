@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     max_failed_logins: int = 5
     lockout_minutes: int = 15
 
+    # An MFA challenge token is single-use: once it succeeds, or once this
+    # many wrong codes have been tried against it, it's burned even though
+    # its 5-minute expiry hasn't passed yet (SA-10).
+    mfa_challenge_max_attempts: int = 5
+
     # The refresh token lives only in this httpOnly cookie for browser
     # clients, so page JavaScript (and therefore an XSS payload) never sees it.
     refresh_cookie_name: str = "ef_refresh"
@@ -138,6 +143,11 @@ class Settings(BaseSettings):
             "STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET": not (self.stripe_secret_key and self.stripe_webhook_secret),
             "SMTP_HOST": not self.smtp_host,
             "DEV_AUTO_ACTIVATE_ORGS (must be unset)": self.dev_auto_activate_orgs,
+            # memory:// is per-process: with more than one worker, each one
+            # enforces its own quota, so the real limit is (configured limit
+            # × worker count) — a shared store closes that gap (SA-10).
+            "RATE_LIMIT_STORAGE_URL (must be a shared store, not memory://)": self.rate_limit_storage_url
+            == "memory://",
         }
         return [name for name, bad in checks.items() if bad]
 

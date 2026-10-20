@@ -8,7 +8,12 @@ records which parts of the target architecture are deliberately not built yet.
 Related docs: [adr/](adr/) (decisions) · [API_STANDARDS.md](API_STANDARDS.md) ·
 [CONTRIBUTING.md](CONTRIBUTING.md) · [MIGRATIONS.md](MIGRATIONS.md) ·
 [OPERATIONS.md](OPERATIONS.md) · [SECURE_DEVELOPMENT.md](SECURE_DEVELOPMENT.md) ·
-[SECURITY_NOTES.md](SECURITY_NOTES.md)
+[SECURITY_NOTES.md](SECURITY_NOTES.md) · [THREAT_MODEL.md](THREAT_MODEL.md) ·
+[AUTHORIZATION_MATRIX.md](AUTHORIZATION_MATRIX.md) ·
+[DATA_CLASSIFICATION.md](DATA_CLASSIFICATION.md) ·
+[SECURITY_VERIFICATION_MATRIX.md](SECURITY_VERIFICATION_MATRIX.md) ·
+[INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md) ·
+[PRIVACY_COMPLIANCE.md](PRIVACY_COMPLIANCE.md)
 
 The short version: **a modular monolith on one PostgreSQL database.**
 Organisation structure, identity, membership, permissions and product modules
@@ -243,7 +248,7 @@ The product architecture brief asks for a lot. Here is where each part stands.
 |---|---|
 | Modular monolith, one Postgres, module boundaries | Built |
 | Tenant isolation, app + RLS, non-owner runtime role, fail-closed context | Built |
-| Unit-level isolation in the database | Built for people data. Groups, events, attendance and giving are still unit-scoped by the application only |
+| Unit-level isolation in the database | Built for people data, groups, events and attendance. Giving (funds, batches, donations, pledges) is still unit-scoped by the application only — none of those tables carry a `unit_id`, so there's no column to scope on without a schema change |
 | Configurable hierarchy, unit types, cycle-safe moves | Built |
 | Later affiliation with governed, consented parent visibility | Built (counts and shared gatherings) |
 | Membership lifecycle, history, several units per person | Built within one church |
@@ -254,4 +259,5 @@ The product architecture brief asks for a lot. Here is where each part stands.
 | Family relationships (parent, guardian, spouse) with their own authorization | Not built. Households exist |
 | Custom fields and form definitions | Not built |
 | Parent-level access beyond aggregates (e.g. shared reports, specific records under policy) | Not built. Would be new grants backed by new `SECURITY DEFINER` functions, never a tenant session |
-| Tamper-evident audit log, retention policies | Not built. `audit_logs` is append-only by convention |
+| Tamper-evident audit log | Built — per-organisation hash chain, triggers refuse UPDATE/DELETE/TRUNCATE for every app role, signed checkpoints outside the database ([ADR-0007](adr/0007-tamper-evident-audit-log.md)) |
+| Audit log retention policy | Not built. The chain is append-only forever; no row is ever pruned |

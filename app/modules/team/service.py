@@ -7,6 +7,7 @@ from app.core.authz import Scope, ensure_grantable
 from app.core.config import get_settings
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.core.security import hash_refresh_token
+from app.modules.audit.service import write_audit
 from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID
 from app.modules.rbac.service import resolve_permissions
 from app.modules.team import repository
@@ -168,7 +169,7 @@ async def request_leadership_transfer(
     eligible = await repository.list_active_membership_ids_excluding(
         db, tenant_id, [leader["id"], nominee_membership_id]
     )
-    return await repository.create_transfer(
+    transfer = await repository.create_transfer(
         db,
         tenant_id=tenant_id,
         outgoing_leader_membership_id=leader["id"],
@@ -176,6 +177,16 @@ async def request_leadership_transfer(
         initiated_by_membership_id=leader["id"],
         eligible_approver_ids=eligible,
     )
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=requester_user_id,
+        action="team.leadership_transfer_requested",
+        resource_type="leadership_transfer",
+        resource_id=transfer["id"],
+        metadata={"nominee_membership_id": nominee_membership_id, "required_approvals": transfer["required_approvals"]},
+    )
+    return transfer
 
 
 async def approve_leadership_transfer(
@@ -203,6 +214,15 @@ async def approve_leadership_transfer(
     await repository.add_approval(
         db, transfer_id, approvals, status="completed" if completed else "pending_approvals", completed=completed
     )
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=approver["user_id"],
+        action="team.leadership_transfer_approved",
+        resource_type="leadership_transfer",
+        resource_id=transfer_id,
+        metadata={"approval_count": len(approvals), "required_approvals": transfer["required_approvals"]},
+    )
     if completed:
         await repository.complete_leader_flip(
             db,
@@ -210,10 +230,22 @@ async def approve_leadership_transfer(
             outgoing_membership_id=transfer["outgoing_leader_membership_id"],
             nominee_membership_id=transfer["nominee_membership_id"],
         )
+        await write_audit(
+            db,
+            tenant_id=tenant_id,
+            actor_user_id=approver["user_id"],
+            action="team.leadership_transfer_completed",
+            resource_type="leadership_transfer",
+            resource_id=transfer_id,
+            metadata={
+                "outgoing_leader_membership_id": transfer["outgoing_leader_membership_id"],
+                "nominee_membership_id": transfer["nominee_membership_id"],
+            },
+        )
     return await repository.get_transfer_by_id(db, transfer_id)
 
 
-async def cancel_leadership_transfer(db: Prisma, transfer_id: str, requester_user_id: str) -> None:
+async def cancel_leadership_transfer(db: Prisma, tenant_id: str, transfer_id: str, requester_user_id: str) -> None:
     transfer = await repository.get_transfer_by_id(db, transfer_id)
     if transfer is None:
         raise NotFoundError("No such leadership transfer")
@@ -222,6 +254,14 @@ async def cancel_leadership_transfer(db: Prisma, transfer_id: str, requester_use
     if leader is None or leader["user_id"] != requester_user_id:
         raise ForbiddenError("Only the current church leader can cancel a leadership transfer")
     await repository.cancel_transfer(db, transfer_id)
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=requester_user_id,
+        action="team.leadership_transfer_canceled",
+        resource_type="leadership_transfer",
+        resource_id=transfer_id,
+    )
 
 
 # ── Used by other modules (leadership) ─────────────────────────────────
