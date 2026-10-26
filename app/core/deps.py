@@ -12,7 +12,7 @@ header, query param, or body — only from the verified JWT.
 from collections.abc import AsyncGenerator, Callable
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from prisma import Prisma
 
 from app.core.database import platform_session, tenant_session, unscoped_tenant_session
@@ -22,6 +22,7 @@ from app.core.security import AccessTokenClaims, TokenError, TokenType, decode_t
 
 
 async def get_current_claims(
+    request: Request,
     authorization: Annotated[str | None, Header()] = None,
 ) -> AccessTokenClaims:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -33,7 +34,13 @@ async def get_current_claims(
         raise UnauthorizedError(str(exc)) from exc
     if payload.get("token_type") != TokenType.ACCESS.value:
         raise UnauthorizedError("Not an access token")
-    return AccessTokenClaims(**payload)
+    claims = AccessTokenClaims(**payload)
+    # Stashed so a later authorization failure (app.modules.audit.middleware)
+    # can log who was denied without re-decoding the token — request.state is
+    # the same object throughout the ASGI stack, including in middleware
+    # that wraps this dependency's own call.
+    request.state.claims = claims
+    return claims
 
 
 CurrentClaims = Annotated[AccessTokenClaims, Depends(get_current_claims)]

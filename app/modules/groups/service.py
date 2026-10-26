@@ -197,14 +197,15 @@ async def create_role(db: Prisma, tenant_id: str, payload: GroupRoleCreate) -> d
     key = _key_from(payload.name)
     if await repository.get_role(db, key) is not None:
         raise ConflictError(f'A group role called "{payload.name}" already exists')
-    role = await db.grouprole.create(
-        data={
+    role = await repository.create_role(
+        db,
+        {
             "tenant_id": tenant_id,
             "key": key,
             "name": payload.name,
             "capabilities": sorted(set(payload.capabilities)),
             "rank": payload.rank,
-        }
+        },
     )
     return _role_out(role)
 
@@ -220,7 +221,7 @@ async def update_role(db: Prisma, role_id: str, payload: GroupRoleUpdate) -> dic
         data = {k: v for k, v in data.items() if k == "name"}
     if "capabilities" in data:
         data["capabilities"] = sorted(set(data["capabilities"]))
-    return _role_out(await db.grouprole.update(where={"id": role_id}, data=data))
+    return _role_out(await repository.update_role(db, role_id, data))
 
 
 async def delete_role(db: Prisma, role_id: str) -> None:
@@ -231,4 +232,78 @@ async def delete_role(db: Prisma, role_id: str) -> None:
         raise ConflictError("Built-in group roles can't be deleted")
     if await repository.role_in_use(db, role.key):
         raise ConflictError("Move everyone off this role before deleting it")
-    await db.grouprole.delete(where={"id": role_id})
+    await repository.delete_role(db, role_id)
+
+
+# ── For the member portal ──────────────────────────────────────────────
+# Group memberships belong to this module; the portal decides *who may* do
+# what from the member's own role in the group (portal.service). These are
+# the data operations it needs, so no other module touches these tables.
+
+
+async def groups_of_member(db: Prisma, member_id: str) -> list[dict]:
+    return await repository.groups_of_member(db, member_id)
+
+
+async def get_membership(db: Prisma, membership_id: str):
+    return await repository.get_membership(db, membership_id)
+
+
+async def find_membership(db: Prisma, group_id: str, member_id: str):
+    return await repository.find_membership(db, group_id, member_id)
+
+
+async def find_active_membership(db: Prisma, group_id: str, member_id: str):
+    return await repository.find_active_membership(db, group_id, member_id)
+
+
+async def get_group_record(db: Prisma, group_id: str):
+    return await repository.get_group_record(db, group_id)
+
+
+async def get_role_record(db: Prisma, key: str):
+    return await repository.get_role(db, key)
+
+
+async def list_role_records(db: Prisma) -> list:
+    return await repository.list_roles(db)
+
+
+async def roster_rows(db: Prisma, group_id: str) -> list[dict]:
+    return await repository.roster(db, group_id)
+
+
+async def update_group_fields(db: Prisma, group_id: str, data: dict) -> None:
+    await repository.update_group(db, group_id, data)
+
+
+async def invite_candidates(db: Prisma, group_id: str, term: str) -> list[dict]:
+    return await repository.invite_candidates(db, group_id, term)
+
+
+async def list_memberships(db: Prisma, group_id: str) -> list:
+    return await repository.list_memberships(db, group_id)
+
+
+async def existing_member_ids(db: Prisma, member_ids: list[str]) -> set[str]:
+    return {r["id"] for r in await repository.existing_members(db, member_ids)}
+
+
+async def create_membership(db: Prisma, data: dict) -> None:
+    await repository.add_membership(db, data)
+
+
+async def update_membership_fields(db: Prisma, membership_id: str, data: dict) -> None:
+    await repository.update_membership(db, membership_id, data)
+
+
+async def delete_membership(db: Prisma, membership_id: str) -> None:
+    await repository.delete_membership(db, membership_id)
+
+
+async def count_active_with_role(db: Prisma, group_id: str, role_key: str) -> int:
+    return await repository.count_active_with_role(db, group_id, role_key)
+
+
+async def group_exists(db: Prisma, group_id: str) -> bool:
+    return await repository.get_group_record(db, group_id) is not None

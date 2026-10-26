@@ -8,6 +8,7 @@ import asyncio
 import re
 import secrets
 
+import pyotp
 import pytest
 from prisma import Prisma
 from prisma.errors import PrismaError
@@ -86,13 +87,20 @@ async def test_password_reset_is_single_use_and_ends_existing_sessions(client, c
     ).status_code == 401
     assert (await client.post("/api/v1/auth/login", json={"email": email, "password": new_password})).status_code == 200
 
-    # The reset is in the account-level audit chain, which still verifies.
+    # The reset — and the stale-password login attempt just above, now that
+    # failed logins are audited too (SA-12) — are in the account-level audit
+    # chain, which still verifies.
     async with platform_session() as db:
         rows = await db.query_raw(
             "select action from audit_logs where tenant_id is null and resource_id = $1::uuid order by chain_seq",
             session["user"]["id"],
         )
-        assert [r["action"] for r in rows][-1] == "account.password_reset_completed"
+        assert [r["action"] for r in rows] == [
+            "account.password_reset_requested",
+            "account.password_reset_requested",
+            "account.password_reset_completed",
+            "auth.login_failed",
+        ]
         assert await chain_breaks(db, None) == []
 
 
@@ -262,6 +270,123 @@ async def test_audit_log_is_append_only_and_tampering_is_detected(client, church
         await owner.disconnect()
     async with platform_session() as db:
         assert await chain_breaks(db, tenant_id) == []
+
+
+# ───────────────────────────── SA-12 failed logins & authz denials ─────────────────────────────
+
+
+async def test_failed_logins_and_lockout_are_audited(client, church_payload):
+    payload, session = await _register(client, church_payload, "failed-login")
+    user_id = session["user"]["id"]
+    settings = get_settings()
+
+    for _ in range(settings.max_failed_logins):
+        wrong = await client.post(
+            "/api/v1/auth/login", json={"email": payload["email"], "password": "DefinitelyWrong123!"}
+        )
+        assert wrong.status_code == 401
+
+    async with platform_session() as db:
+        rows = await db.query_raw(
+            "select action from audit_logs where tenant_id is null and resource_id = $1::uuid order by chain_seq",
+            user_id,
+        )
+        actions = [r["action"] for r in rows]
+        assert actions.count("auth.login_failed") == settings.max_failed_logins
+        assert actions[-1] == "auth.account_locked"
+        assert await chain_breaks(db, None) == []
+
+    locked = await client.post("/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]})
+    assert locked.status_code == 423
+
+
+async def test_authorization_denials_are_audited(client, church_payload):
+    from app.modules.rbac.models import SYSTEM_ROLE_MEMBER_ID
+    from tests.conftest import accept_invite
+
+    payload, session = await _register(client, church_payload, "authz-denied")
+    tenant_id = session["active_membership"]["tenant_id"]
+    lead = auth(session["access_token"])
+
+    invite = await client.post(
+        "/api/v1/team/invite", json={"email": unique_email("member"), "role_id": SYSTEM_ROLE_MEMBER_ID}, headers=lead
+    )
+    assert invite.status_code == 200, invite.text
+    accepted = await accept_invite(client, invite.json()["invite_url"])
+    member = auth(accepted["access_token"])
+
+    denied = await client.get("/api/v1/members", headers=member)
+    assert denied.status_code == 403
+
+    async with platform_session() as db:
+        rows = await db.query_raw(
+            "select actor_user_id, metadata from audit_logs"
+            " where tenant_id = $1::uuid and action = $2 order by chain_seq",
+            tenant_id,
+            "authz.permission_denied",
+        )
+        assert rows[-1]["actor_user_id"] == accepted["user"]["id"]
+        assert rows[-1]["metadata"]["path"] == "/api/v1/members"
+        assert await chain_breaks(db, tenant_id) == []
+
+
+# ───────────────────────────── SA-10 MFA challenge single-use ─────────────────────────────
+
+
+async def test_mfa_challenge_tokens_cannot_be_replayed_after_success(client, church_payload):
+    payload, session = await _register(client, church_payload, "mfa-single-use")
+    h = auth(session["access_token"])
+    setup = (await client.post("/api/v1/auth/mfa/setup", headers=h)).json()
+    secret = setup["secret"]
+    verify = await client.post("/api/v1/auth/mfa/verify", headers=h, json={"code": pyotp.TOTP(secret).now()})
+    assert verify.status_code == 204, verify.text
+
+    login = await client.post("/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]})
+    challenge = login.json()["challenge_token"]
+
+    done = await client.post(
+        "/api/v1/auth/mfa/challenge", json={"challenge_token": challenge, "code": pyotp.TOTP(secret).now()}
+    )
+    assert done.status_code == 200, done.text
+
+    # Same token, a fresh and otherwise-correct code: still rejected, because
+    # the token itself — not just that one code — was consumed on success.
+    replayed = await client.post(
+        "/api/v1/auth/mfa/challenge", json={"challenge_token": challenge, "code": pyotp.TOTP(secret).now()}
+    )
+    assert replayed.status_code == 401
+    assert replayed.json()["error"]["code"] == "mfa_challenge_invalid"
+
+
+async def test_mfa_challenge_attempts_are_capped_per_token():
+    """Exercised at the repository directly, not over HTTP: the default
+    per-token cap and the account lockout threshold are both 5, so driving
+    this through /auth/mfa/challenge with wrong codes would lock the account
+    on the same attempt that exhausts the token, testing lockout instead of
+    the thing this test is for."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.modules.identity import repository
+
+    settings = get_settings()
+    async with platform_session() as db:
+        user = await db.user.create(
+            data={"email": unique_email("mfa-cap"), "first_name": "Cap", "last_name": "Test", "mfa_enabled": True}
+        )
+        jti = secrets.token_urlsafe(8)
+        expires_at = datetime.now(UTC) + timedelta(minutes=5)
+
+        for expected in range(1, settings.mfa_challenge_max_attempts + 1):
+            attempt = await repository.claim_mfa_attempt(db, jti=jti, user_id=user.id, expires_at=expires_at)
+            assert attempt == expected
+
+        # One more claim past the cap: the caller is expected to burn it here.
+        attempt = await repository.claim_mfa_attempt(db, jti=jti, user_id=user.id, expires_at=expires_at)
+        assert attempt == settings.mfa_challenge_max_attempts + 1
+        await repository.burn_mfa_attempt(db, jti)
+
+        # Burned: every further claim reports "already gone".
+        assert await repository.claim_mfa_attempt(db, jti=jti, user_id=user.id, expires_at=expires_at) is None
 
 
 # ───────────────────────────── DIF-11 observability ─────────────────────────────

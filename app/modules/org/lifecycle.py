@@ -9,6 +9,7 @@ from prisma import Prisma
 
 from app.core.exceptions import ConflictError, NotFoundError
 from app.modules.audit.service import write_audit
+from app.modules.org import repository
 
 #: Which transitions are allowed, from → to.
 TRANSITIONS: dict[str, set[str]] = {
@@ -30,13 +31,13 @@ async def transition(
     note: str | None = None,
     tier: str | None = None,
 ) -> None:
-    org = await db.organization.find_unique(where={"id": org_id})
+    org = await repository.get_org(db, org_id)
     if org is None:
         raise NotFoundError("No such organisation")
     if org.status == to_status and to_status == "active":
         # Paying again while active (e.g. a plan change) is not a transition.
         if tier and tier != org.tier:
-            await db.organization.update(where={"id": org_id}, data={"tier": tier})
+            await repository.update_org(db, org_id, {"tier": tier})
         return
     if to_status not in TRANSITIONS.get(org.status, set()):
         raise ConflictError(f"A {org.status} organisation can't become {to_status}")
@@ -46,7 +47,7 @@ async def transition(
         data.update(activated_at=datetime.now(UTC), activation_source=source, activation_note=note)
     if tier:
         data["tier"] = tier
-    await db.organization.update(where={"id": org_id}, data=data)
+    await repository.update_org(db, org_id, data)
     await write_audit(
         db,
         tenant_id=org_id,

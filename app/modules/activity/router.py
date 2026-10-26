@@ -1,12 +1,11 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.core.authz import CurrentScope, ensure_event_readable, ensure_event_writable, ensure_member_visible
-from app.core.database import set_tenant_context
 from app.core.deps import CurrentClaims, PreTenantDb, TenantDb, require_permission
-from app.core.exceptions import NotFoundError
 from app.core.pagination import PaginatedRoute
+from app.core.rate_limit import limiter
 from app.modules.activity import service
 from app.modules.activity.schemas import (
     AttendanceMarkInput,
@@ -15,11 +14,19 @@ from app.modules.activity.schemas import (
     ChurchEventCreate,
     ChurchEventRead,
     ChurchEventUpdate,
+    CollisionCheckInput,
+    EventCollision,
     EventListItem,
+    EventRegistrationInput,
+    EventRegistrationRead,
     HeadcountEntry,
+    NotifyKeyParticipantsInput,
     PublicEvent,
+    PublicEventDetail,
+    RegistrationFieldRead,
     ReviewDecisionInput,
     ReviewerOption,
+    SetRegistrationFieldsInput,
     SubmitForReviewInput,
 )
 
@@ -54,6 +61,23 @@ async def review_queue(claims: CurrentClaims, db: TenantDb):
 )
 async def reviewer_options(claims: CurrentClaims, db: TenantDb):
     return await service.reviewer_options(db, claims.sub)
+
+
+@router.post(
+    "/collisions", response_model=list[EventCollision], dependencies=[Depends(require_permission("events:create"))]
+)
+async def check_collisions(payload: CollisionCheckInput, db: TenantDb):
+    """Other groups' gatherings this one would overlap, before it's even
+    saved — called live as the organiser picks a group and a time."""
+    return await service.check_collisions(db, payload)
+
+
+@router.post("/notify-conflict", response_model=int, dependencies=[Depends(require_permission("events:create"))])
+async def notify_conflict(payload: NotifyKeyParticipantsInput, claims: CurrentClaims, db: TenantDb):
+    """Asks each named leader which of the two clashing gatherings they'll
+    be at. Returns how many were actually reached (some leaders have no
+    portal login yet)."""
+    return await service.notify_key_participants(db, claims.tenant_id, payload)
 
 
 @router.get("/{event_id}", response_model=ChurchEventRead, dependencies=[Depends(require_permission("events:read"))])
@@ -178,6 +202,46 @@ async def list_occurrences(
     return await service.occurrences(db, event_id, start, end)
 
 
+# ───────────────────────────── Registration forms ─────────────────────────────
+
+
+@router.get(
+    "/{event_id}/fields",
+    response_model=list[RegistrationFieldRead],
+    dependencies=[Depends(require_permission("events:read"))],
+)
+async def get_registration_fields(event_id: str, db: TenantDb, scope: CurrentScope):
+    await ensure_event_readable(db, scope, event_id)
+    return await service.get_registration_fields(db, event_id)
+
+
+@router.put(
+    "/{event_id}/fields",
+    response_model=list[RegistrationFieldRead],
+    dependencies=[Depends(require_permission("events:update"))],
+)
+async def set_registration_fields(
+    event_id: str, payload: SetRegistrationFieldsInput, claims: CurrentClaims, scope: CurrentScope, db: TenantDb
+):
+    """Replaces the whole registration form, in the order given."""
+    await ensure_event_writable(db, scope, event_id)
+    fields = [f.model_dump() for f in payload.fields]
+    return await service.set_registration_fields(db, claims.tenant_id, event_id, fields)
+
+
+@router.get(
+    "/{event_id}/responses",
+    response_model=list[EventRegistrationRead],
+    dependencies=[Depends(require_permission("events:update"))],
+)
+async def list_responses(event_id: str, db: TenantDb, scope: CurrentScope):
+    # Gated at organiser level (events:update), not plain events:read —
+    # respondents' contact details and answers are collected for whoever
+    # runs the event, not for anyone who can merely see the calendar.
+    await ensure_event_writable(db, scope, event_id)
+    return await service.list_registrations(db, event_id)
+
+
 # ───────────────────────────── Public ─────────────────────────────
 public_router = APIRouter(route_class=PaginatedRoute, prefix="/churches", tags=["church-directory"])
 
@@ -185,9 +249,19 @@ public_router = APIRouter(route_class=PaginatedRoute, prefix="/churches", tags=[
 @public_router.get("/{slug}/events", response_model=list[PublicEvent])
 async def public_events(slug: str, db: PreTenantDb):
     """A live church's published, public gatherings — nothing else."""
-    org = await db.organization.find_unique(where={"slug": slug})
-    if org is None or org.status not in ("trial", "active"):
-        raise NotFoundError("No church found at this address")
-    # Read this one church's rows under RLS, exactly like a tenant session.
-    await set_tenant_context(db, org.id)
-    return await service.public_events(db)
+    return await service.public_events_for_church(db, slug)
+
+
+@public_router.get("/{slug}/events/{event_id}", response_model=PublicEventDetail)
+async def public_event_detail(slug: str, event_id: str, db: PreTenantDb):
+    """One published, public gathering, with its registration questions —
+    what the share link shows before someone RSVPs."""
+    return await service.public_event_detail(db, slug, event_id)
+
+
+@public_router.post("/{slug}/events/{event_id}/register", response_model=EventRegistrationRead, status_code=201)
+@limiter.limit("20/hour")
+async def register_for_event(
+    request: Request, slug: str, event_id: str, payload: EventRegistrationInput, db: PreTenantDb
+):
+    return await service.submit_registration(db, slug, event_id, payload.model_dump())

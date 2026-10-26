@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from prisma import Prisma
 from prisma.models import Member, PastoralNote, SacramentalRecord
 
@@ -157,13 +159,51 @@ async def list_visitor_followups(db: Prisma) -> list[dict]:
                upper(left(m.first_name,1) || left(m.last_name,1)) as initials,
                m.status, hu.name as unit_name, m.envelope_number, m.last_seen_at,
                m.joined_at as visit_date,
-               extract(day from now() - m.joined_at)::int as days_since_visit
+               extract(day from now() - m.joined_at)::int as days_since_visit,
+               m.followup_assigned_to_user_id, (u.first_name || ' ' || u.last_name) as followup_assigned_to_name,
+               m.followup_resolved_at, m.followup_note
         from members m
         left join hierarchy_units hu on hu.id = m.unit_id
+        left join users u on u.id = m.followup_assigned_to_user_id
         where m.status = 'visitor'
         order by m.joined_at asc
         """
     )
+
+
+async def user_is_active_team_member(db: Prisma, user_id: str) -> bool:
+    rows = await db.query_raw(
+        "select 1 from tenant_memberships where user_id = $1::uuid and status = 'active'", user_id
+    )
+    return bool(rows)
+
+
+async def assign_followup(db: Prisma, member_id: str, *, assigned_to_user_id: str) -> None:
+    await db.member.update(
+        where={"id": member_id},
+        data={
+            "followup_assigned_to_user_id": assigned_to_user_id,
+            "followup_assigned_at": datetime.now(UTC),
+            "followup_resolved_at": None,
+        },
+    )
+
+
+async def unassign_followup(db: Prisma, member_id: str) -> None:
+    await db.member.update(
+        where={"id": member_id},
+        data={"followup_assigned_to_user_id": None, "followup_assigned_at": None},
+    )
+
+
+async def resolve_followup(db: Prisma, member_id: str, *, note: str | None) -> None:
+    await db.member.update(
+        where={"id": member_id}, data={"followup_resolved_at": datetime.now(UTC), "followup_note": note}
+    )
+
+
+async def reopen_followup(db: Prisma, member_id: str) -> None:
+    await db.member.update(where={"id": member_id}, data={"followup_resolved_at": None})
 
 
 async def group_refs_for(db: Prisma, member_ids: list[str]) -> dict[str, list[dict]]:

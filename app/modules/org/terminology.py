@@ -12,6 +12,7 @@ from prisma import Json, Prisma
 from pydantic import BaseModel, Field, field_validator
 
 from app.modules.audit.service import write_audit
+from app.modules.org import repository
 
 #: Every term a church can rename, with the default wording.
 DEFAULT_TERMS: dict[str, str] = {
@@ -75,21 +76,16 @@ def _read(overrides: dict[str, str]) -> dict:
 
 
 async def get_terminology(db: Prisma, tenant_id: str) -> dict:
-    row = await db.organizationconfiguration.find_unique(where={"tenant_id": tenant_id})
+    row = await repository.get_configuration(db, tenant_id)
     return _read(_as_dict(row.terminology) if row else {})
 
 
 async def update_terminology(db: Prisma, tenant_id: str, user_id: str, payload: TerminologyUpdate) -> dict:
-    await db.organizationconfiguration.upsert(
-        where={"tenant_id": tenant_id},
-        data={
-            "create": {"tenant_id": tenant_id, "terminology": Json(payload.overrides), "updated_by_user_id": user_id},
-            "update": {
-                "terminology": Json(payload.overrides),
-                "updated_by_user_id": user_id,
-                "updated_at": datetime.now(UTC),
-            },
-        },
+    await repository.upsert_configuration(
+        db,
+        tenant_id,
+        create={"tenant_id": tenant_id, "terminology": Json(payload.overrides), "updated_by_user_id": user_id},
+        update={"terminology": Json(payload.overrides), "updated_by_user_id": user_id, "updated_at": datetime.now(UTC)},
     )
     await write_audit(
         db,

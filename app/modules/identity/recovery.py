@@ -27,6 +27,7 @@ from app.core.exceptions import UnauthorizedError
 from app.core.mailer import OutgoingEmail
 from app.core.security import hash_password, hash_refresh_token
 from app.modules.audit.service import write_audit
+from app.modules.identity import repository
 
 _INVALID = "This reset link is invalid or has expired. Ask for a new one."
 
@@ -40,24 +41,21 @@ async def request_reset(db: Prisma, *, email: str, ip_address: str | None) -> Ou
     respond identically either way."""
     settings = get_settings()
     raw_token = secrets.token_urlsafe(32)  # generated regardless, so both paths do the same work
-    user = await db.user.find_unique(where={"email": email.strip().lower()})
+    user = await repository.get_user_by_email(db, email.strip().lower())
     if user is None or user.status != "active" or not user.password_hash:
         return None
 
-    recent = await db.passwordresettoken.count(
-        where={"user_id": user.id, "created_at": {"gte": _now() - timedelta(hours=1)}}
-    )
+    recent = await repository.count_recent_reset_tokens(db, user.id, since=_now() - timedelta(hours=1))
     if recent >= settings.password_reset_max_per_hour:
         return None
 
-    await db.passwordresettoken.update_many(where={"user_id": user.id, "used_at": None}, data={"used_at": _now()})
-    await db.passwordresettoken.create(
-        data={
-            "user_id": user.id,
-            "token_hash": hash_refresh_token(raw_token),
-            "expires_at": _now() + timedelta(minutes=settings.password_reset_ttl_minutes),
-            "requested_ip": ip_address,
-        }
+    await repository.void_unused_reset_tokens(db, user.id)
+    await repository.create_reset_token(
+        db,
+        user_id=user.id,
+        token_hash=hash_refresh_token(raw_token),
+        expires_at=_now() + timedelta(minutes=settings.password_reset_ttl_minutes),
+        requested_ip=ip_address,
     )
     await write_audit(
         db,
@@ -83,31 +81,20 @@ async def request_reset(db: Prisma, *, email: str, ip_address: str | None) -> Ou
 
 
 async def complete_reset(db: Prisma, *, raw_token: str, new_password: str, ip_address: str | None) -> None:
-    row = await db.passwordresettoken.find_unique(where={"token_hash": hash_refresh_token(raw_token)})
+    row = await repository.get_reset_token_by_hash(db, hash_refresh_token(raw_token))
     if row is None or row.used_at is not None or row.expires_at <= _now():
         raise UnauthorizedError(_INVALID, code="reset_invalid")
-    user = await db.user.find_unique(where={"id": row.user_id})
+    user = await repository.get_user_by_id(db, row.user_id)
     if user is None or user.status != "active":
         raise UnauthorizedError(_INVALID, code="reset_invalid")
 
-    # Consume first, conditionally: of two simultaneous uses only one updates a row.
-    consumed = await db.execute_raw(
-        "update password_reset_tokens set used_at = now() where id = $1::uuid and used_at is null", row.id
-    )
+    consumed = await repository.consume_reset_token(db, row.id)
     if consumed != 1:
         raise UnauthorizedError(_INVALID, code="reset_invalid")
 
-    await db.execute_raw(
-        """
-        update users set password_hash = $2, password_changed_at = now(),
-               failed_login_count = 0, locked_until = null
-         where id = $1::uuid
-        """,
-        user.id,
-        hash_password(new_password),
-    )
-    await db.passwordresettoken.update_many(where={"user_id": user.id, "used_at": None}, data={"used_at": _now()})
-    await db.refreshtoken.update_many(where={"user_id": user.id, "revoked_at": None}, data={"revoked_at": _now()})
+    await repository.reset_password_and_clear_lockout(db, user.id, password_hash=hash_password(new_password))
+    await repository.void_unused_reset_tokens(db, user.id)
+    await repository.revoke_all_refresh_tokens(db, user.id)
     await write_audit(
         db,
         tenant_id=None,

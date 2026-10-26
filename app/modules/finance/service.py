@@ -5,6 +5,7 @@ from prisma import Prisma
 from app.core.exceptions import ConflictError, NotFoundError
 from app.modules.finance import repository
 from app.modules.finance.schemas import DonationBatchCreate, DonationEntryForm, FundCreate
+from app.modules.people import service as people_service
 
 # Never interpolate a client-supplied string into SQL — this is the only
 # place `period` is allowed to become a Postgres date_trunc unit, and only
@@ -215,3 +216,10 @@ async def generate_contribution_statement(db: Prisma, member_id: str, year: int)
         ],
         "generated_at": datetime.now(UTC),
     }
+
+
+async def is_own_member_record(db: Prisma, user_id: str, member_id: str) -> bool:
+    """Whether this login is linked to that member record — resolved from
+    the data, never from a role name."""
+    own = await people_service.get_member_by_user_id(db, user_id)
+    return own is not None and own["id"] == member_id

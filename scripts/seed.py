@@ -22,7 +22,7 @@ from prisma import Json, Prisma
 from app.core.config import get_settings
 from app.core.prisma_utils import coerce_dates
 from app.core.security import hash_password
-from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_STAFF_ID
+from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID, SYSTEM_ROLE_STAFF_ID
 
 ORG_SLUGS = ["st-judes-parish", "grace-community-church", "lagos-diocese"]
 SEED_EMAIL_DOMAIN = "@seed.ecclesiaflow.dev"
@@ -70,7 +70,7 @@ async def seed_org(
         data={
             "user_id": leader_user.id,
             "tenant_id": org.id,
-            "role_id": SYSTEM_ROLE_STAFF_ID,
+            "role_id": SYSTEM_ROLE_LEADER_ID,
             "is_primary": True,
             "is_leader": True,
             "status": "active",
@@ -90,6 +90,24 @@ async def seed_org(
             "user_id": board_user.id,
             "tenant_id": org.id,
             "role_id": SYSTEM_ROLE_BOARD_ID,
+            "is_primary": True,
+            "status": "active",
+            "accepted_at": datetime.now(UTC),
+        }
+    )
+    staff_user = await db.user.create(
+        data={
+            "email": f"staff.{slug}{SEED_EMAIL_DOMAIN}",
+            "password_hash": hash_password("SeedData2026Pass"),
+            "first_name": "Amara",
+            "last_name": "Diallo",
+        }
+    )
+    await db.tenantmembership.create(
+        data={
+            "user_id": staff_user.id,
+            "tenant_id": org.id,
+            "role_id": SYSTEM_ROLE_STAFF_ID,
             "is_primary": True,
             "status": "active",
             "accepted_at": datetime.now(UTC),
@@ -330,7 +348,63 @@ async def seed_org(
     for perm in ("members:read", "events:read", "announcements:read", "announcements:create"):
         await db.rolepermission.create(data={"role_id": media_role.id, "permission": perm})
 
-    return {"org": org, "leader_email": leader_user.email, "root_unit_id": root.id}
+    # ── Groups ────────────────────────────────────────────────────────────
+    # Mirrors tenant.service.seed_default_group_roles — a real registration
+    # gets these automatically; this script creates the organization
+    # directly, bypassing that helper, so they're seeded explicitly here.
+    for key, name, capabilities, rank in (
+        ("leader", "Leader", ["manage_roster", "edit_group", "message", "manage_events"], 0),
+        ("assistant", "Assistant", ["manage_roster", "message"], 10),
+        ("member", "Member", [], 100),
+    ):
+        await db.grouprole.create(
+            data={
+                "tenant_id": org.id,
+                "key": key,
+                "name": name,
+                "capabilities": capabilities,
+                "rank": rank,
+                "is_system": True,
+            }
+        )
+    choir = await db.group.create(
+        data={
+            "tenant_id": org.id,
+            "name": "Choir",
+            "type": "ministry",
+            "description": "Sunday worship choir",
+            "unit_id": root.id,
+            "meeting_frequency": "weekly",
+            "meeting_day": "thursday",
+        }
+    )
+    await db.groupmembership.create(
+        data={
+            "tenant_id": org.id,
+            "group_id": choir.id,
+            "member_id": linked_member.id,
+            "role": "leader",
+            "status": "active",
+        }
+    )
+    for member_id in member_ids[1:4]:
+        await db.groupmembership.create(
+            data={
+                "tenant_id": org.id,
+                "group_id": choir.id,
+                "member_id": member_id,
+                "role": "member",
+                "status": "active",
+            }
+        )
+
+    return {
+        "org": org,
+        "leader_email": leader_user.email,
+        "board_email": board_user.email,
+        "staff_email": staff_user.email,
+        "root_unit_id": root.id,
+    }
 
 
 async def main() -> None:
@@ -393,7 +467,10 @@ async def main() -> None:
 
     print("Seeded:")
     for s in summary:
-        print(f"  {s['org'].display_name}  ({s['org'].slug})  leader login: {s['leader_email']} / SeedData2026Pass")
+        print(f"  {s['org'].display_name}  ({s['org'].slug})")
+        print(f"    leader login: {s['leader_email']} / SeedData2026Pass")
+        print(f"    board login:  {s['board_email']} / SeedData2026Pass")
+        print(f"    staff login:  {s['staff_email']} / SeedData2026Pass")
     print(f"  Platform admin login: platform-admin{SEED_EMAIL_DOMAIN} / SeedData2026Pass")
 
 

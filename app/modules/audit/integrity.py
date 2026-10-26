@@ -25,6 +25,8 @@ from datetime import UTC, datetime
 
 from prisma import Prisma
 
+from app.modules.audit import repository
+
 
 def _canonical(heads: list[dict]) -> bytes:
     return json.dumps(heads, sort_keys=True, separators=(",", ":")).encode()
@@ -36,14 +38,14 @@ def _sign(key: str, heads: list[dict]) -> str:
 
 async def chain_breaks(db: Prisma, tenant_id: str | None) -> list[dict]:
     """[] when the chain is intact, else the first break."""
-    return await db.query_raw("select * from verify_audit_chain($1::uuid)", tenant_id)
+    return await repository.chain_breaks(db, tenant_id)
 
 
 async def create_checkpoint(db: Prisma, key: str, tenant_ids: list[str] | None = None) -> dict:
     """All chains by default; ``tenant_ids`` limits it to some organisations.
     Run on a plain client, not inside a short interactive transaction: with
     many organisations, verification takes a while."""
-    rows = await db.query_raw("select tenant_id, chain_seq, row_hash from audit_chain_heads()")
+    rows = await repository.chain_heads(db)
     if tenant_ids is not None:
         rows = [r for r in rows if r["tenant_id"] in tenant_ids]
     heads = sorted(
@@ -62,11 +64,7 @@ async def verify_checkpoint(db: Prisma, key: str, checkpoint: dict) -> list[str]
         label = head["tenant_id"] or "account events"
         for brk in await chain_breaks(db, head["tenant_id"]):
             problems.append(f"{label}: chain broken at #{brk['broken_at_seq']} ({brk['reason']})")
-        rows = await db.query_raw(
-            "select row_hash from audit_logs where tenant_id is not distinct from $1::uuid and chain_seq = $2",
-            head["tenant_id"],
-            head["chain_seq"],
-        )
+        rows = await repository.get_row_hash(db, head["tenant_id"], head["chain_seq"])
         if not rows:
             problems.append(f"{label}: checkpointed entry #{head['chain_seq']} is missing")
         elif rows[0]["row_hash"] != head["row_hash"]:

@@ -170,3 +170,57 @@ async def test_group_roster_roles_and_archiving(client, church_payload):
 
     removed = await client.delete(f"/api/v1/groups/{g['id']}/members/{m['id']}", headers=headers)
     assert removed.status_code == 204
+
+
+async def test_visitor_followup_assignment_is_real(client, church_payload):
+    """Was cosmetic before: the API hardcoded assigned_to to null and the
+    frontend's "Reached" button never called it. Now both persist."""
+    resp = await client.post("/api/v1/auth/register", json=church_payload("followup"))
+    session = resp.json()
+    headers = {"Authorization": f"Bearer {session['access_token']}"}
+    leader_id = session["user"]["id"]
+
+    visitor = await client.post(
+        "/api/v1/members/visitor-quick-add", json={"first_name": "Janet", "last_name": "Mugisha"}, headers=headers
+    )
+    assert visitor.status_code == 200, visitor.text
+    member_id = visitor.json()["id"]
+
+    queue = (await client.get("/api/v1/members/visitor-followups", headers=headers)).json()
+    row = next(r for r in queue if r["member_id"] == member_id)
+    assert row["status"] == "pending" and row["assigned_to_id"] is None
+
+    # Can't assign to someone who isn't a team member here.
+    bad = await client.post(
+        f"/api/v1/members/{member_id}/followup/assign",
+        json={"assigned_to_user_id": str(uuid.uuid4())},
+        headers=headers,
+    )
+    assert bad.status_code == 409
+
+    assigned = await client.post(
+        f"/api/v1/members/{member_id}/followup/assign", json={"assigned_to_user_id": leader_id}, headers=headers
+    )
+    assert assigned.status_code == 204
+
+    queue = (await client.get("/api/v1/members/visitor-followups", headers=headers)).json()
+    row = next(r for r in queue if r["member_id"] == member_id)
+    assert row["status"] == "assigned" and row["assigned_to_id"] == leader_id and row["assigned_to_name"]
+
+    resolved = await client.post(
+        f"/api/v1/members/{member_id}/followup/resolve", json={"note": "Coffee chat after service"}, headers=headers
+    )
+    assert resolved.status_code == 204
+    queue = (await client.get("/api/v1/members/visitor-followups", headers=headers)).json()
+    row = next(r for r in queue if r["member_id"] == member_id)
+    assert row["status"] == "resolved" and row["notes"] == "Coffee chat after service"
+
+    # Reopening keeps the assignment; unassigning clears it outright.
+    await client.post(f"/api/v1/members/{member_id}/followup/reopen", headers=headers)
+    queue = (await client.get("/api/v1/members/visitor-followups", headers=headers)).json()
+    assert next(r for r in queue if r["member_id"] == member_id)["status"] == "assigned"
+
+    await client.delete(f"/api/v1/members/{member_id}/followup/assign", headers=headers)
+    queue = (await client.get("/api/v1/members/visitor-followups", headers=headers)).json()
+    row = next(r for r in queue if r["member_id"] == member_id)
+    assert row["status"] == "pending" and row["assigned_to_id"] is None

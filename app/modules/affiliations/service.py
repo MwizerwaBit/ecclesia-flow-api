@@ -30,6 +30,7 @@ from app.modules.affiliations.schemas import (
     AffiliationPropose,
 )
 from app.modules.audit.service import write_audit
+from app.modules.org import service as org_service
 
 _LIVE = ("active", "trial")
 
@@ -82,13 +83,13 @@ async def list_affiliations(db: Prisma, tenant_id: str) -> list[dict]:
 
 
 async def propose(db: Prisma, *, tenant_id: str, user_id: str, payload: AffiliationPropose) -> dict:
-    counterpart = await db.organization.find_unique(where={"slug": payload.counterpart_slug})
+    counterpart = await org_service.find_org_by_slug(db, payload.counterpart_slug)
     if counterpart is None or counterpart.status not in _LIVE:
         raise NotFoundError("No organisation found at this address")
     if counterpart.id == tenant_id:
         raise AppError("A church can't affiliate with itself", code="self_affiliation")
 
-    me = await db.organization.find_unique(where={"id": tenant_id})
+    me = await org_service.find_org(db, tenant_id)
     if payload.counterpart_role == "parent":
         child, parent = me, counterpart
     else:
@@ -139,8 +140,8 @@ async def accept(db: Prisma, *, tenant_id: str, user_id: str, affiliation_id: st
             raise ForbiddenError("Only the church joining decides what it shares", code="grants_are_childs")
         grants = sorted(set(payload.grants))
 
-    parent = await db.organization.find_unique(where={"id": row["parent_org_id"]})
-    child = await db.organization.find_unique(where={"id": row["child_org_id"]})
+    parent = await org_service.find_org(db, row["parent_org_id"])
+    child = await org_service.find_org(db, row["child_org_id"])
     if parent.status not in _LIVE or child.status not in _LIVE:
         raise ConflictError("One of the organisations is no longer active", code="org_inactive")
     _require_verified_parent(parent)

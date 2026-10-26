@@ -271,6 +271,14 @@ class VisitorFollowUp(BaseModel):
     notes: str | None
 
 
+class AssignFollowUpInput(BaseModel):
+    assigned_to_user_id: str
+
+
+class ResolveFollowUpInput(BaseModel):
+    note: Annotated[str, StringConstraints(max_length=2000)] | None = None
+
+
 class PastoralNoteRead(BaseModel):
     id: str
     member_id: str

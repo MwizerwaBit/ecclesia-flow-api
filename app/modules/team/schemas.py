@@ -34,6 +34,13 @@ class InviteStaffPayload(BaseModel):
     message: str | None = None
 
 
+class AddAssignmentPayload(BaseModel):
+    """Another role over another scope for someone already on the team."""
+
+    role_id: str
+    unit_scope: str | None = None
+
+
 class UpdateAssignmentPayload(BaseModel):
     role_id: str | None = None
     unit_scope: str | None = None

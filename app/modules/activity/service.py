@@ -3,16 +3,21 @@ from datetime import UTC, datetime, timedelta
 
 from prisma import Json, Prisma
 
-from app.core.exceptions import ConflictError, NotFoundError
+from app.core.database import set_tenant_context
+from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.modules.activity import recurrence, repository
 from app.modules.activity.schemas import (
     AttendanceMarkInput,
     ChurchEventCreate,
     ChurchEventUpdate,
+    CollisionCheckInput,
     HeadcountEntry,
+    NotifyKeyParticipantsInput,
 )
 from app.modules.audit.service import write_audit
+from app.modules.groups import service as groups_service
 from app.modules.rbac.service import resolve_permissions
+from app.modules.tenant import service as tenant_service
 
 
 def _decorate(row: dict, now: datetime | None = None) -> dict:
@@ -54,7 +59,7 @@ async def get_event(db: Prisma, event_id: str) -> dict:
 
 
 async def _check_group(db: Prisma, group_id: str | None) -> None:
-    if group_id and await db.group.find_unique(where={"id": group_id}) is None:
+    if group_id and not await groups_service.group_exists(db, group_id):
         raise NotFoundError("No such group")
 
 
@@ -95,7 +100,7 @@ async def update_event(db: Prisma, event_id: str, payload: ChurchEventUpdate) ->
     if data and existing.status == "pending_review":
         # What the reviewers are looking at changed: they review it again.
         data["status"] = "draft"
-        await db.eventreview.delete_many(where={"event_id": event_id})
+        await repository.clear_reviews(db, event_id)
     if data:
         await repository.update_event(db, event_id, data)
     return await get_event(db, event_id)
@@ -129,9 +134,9 @@ async def submit_for_review(
         raise ConflictError(
             "Reviewers must be other team members allowed to review gatherings", code="invalid_reviewer"
         )
-    await db.eventreview.delete_many(where={"event_id": event_id})
+    await repository.clear_reviews(db, event_id)
     for reviewer in reviewers:
-        await db.eventreview.create(data={"tenant_id": tenant_id, "event_id": event_id, "reviewer_user_id": reviewer})
+        await repository.create_review(db, tenant_id=tenant_id, event_id=event_id, reviewer_user_id=reviewer)
     await repository.update_event(db, event_id, {"status": "pending_review", "submitted_at": datetime.now(UTC)})
     await write_audit(
         db,
@@ -153,19 +158,17 @@ async def decide_review(
     event = await repository.get_event(db, event_id)
     if event is None or event.status != "pending_review":
         raise NotFoundError("Nothing to review here")
-    review = await db.eventreview.find_first(where={"event_id": event_id, "reviewer_user_id": reviewer_user_id})
+    review = await repository.find_review(db, event_id, reviewer_user_id)
     if review is None:
         # Not assigned to you: indistinguishable from not existing.
         raise NotFoundError("Nothing to review here")
     if review.status != "pending":
         raise ConflictError("You've already reviewed this")
     now = datetime.now(UTC)
-    await db.eventreview.update(
-        where={"id": review.id}, data={"status": decision, "comment": comment, "decided_at": now}
-    )
+    await repository.record_review_decision(db, review.id, {"status": decision, "comment": comment, "decided_at": now})
     if decision == "changes_requested":
         await repository.update_event(db, event_id, {"status": "changes_requested"})
-    elif await db.eventreview.count(where={"event_id": event_id, "status": {"not": "approved"}}) == 0:
+    elif await repository.count_reviews_not_approved(db, event_id) == 0:
         await repository.update_event(db, event_id, {"status": "published", "published_at": now})
     await write_audit(
         db,
@@ -235,6 +238,14 @@ async def events_for_member(db: Prisma, member_id: str | None) -> list[dict]:
     return [_decorate(r) for r in await repository.list_events_for_member(db, member_id)]
 
 
+async def public_events_for_church(db: Prisma, slug: str) -> list[dict]:
+    """A live church's published, public gatherings, read under RLS exactly
+    like a tenant session."""
+    org = await tenant_service.get_live_org_by_slug(db, slug)
+    await set_tenant_context(db, org.id)
+    return await public_events(db)
+
+
 async def public_events(db: Prisma) -> list[dict]:
     now = datetime.now(UTC)
     out = []
@@ -299,3 +310,111 @@ async def submit_headcount(db: Prisma, tenant_id: str, marked_by_user_id: str, p
         total=payload.total,
         marked_by_user_id=marked_by_user_id,
     )
+
+
+# ───────────────────────────── Schedule collisions ─────────────────────────────
+
+
+async def check_collisions(db: Prisma, payload: CollisionCheckInput) -> list[dict]:
+    if not await groups_service.group_exists(db, payload.group_id):
+        raise NotFoundError("No such group")
+    end = payload.end_date_time or (payload.start_date_time + timedelta(hours=2))
+    rows = await repository.find_colliding_events(
+        db, group_id=payload.group_id, start=payload.start_date_time, end=end, exclude_event_id=payload.exclude_event_id
+    )
+    out = []
+    for r in rows:
+        candidates = await repository.key_participants_for(db, group_ids=[payload.group_id, r["group_id"]])
+        # Someone leading both colliding groups appears once per group here —
+        # they're still one person to ask, not two.
+        key_participants = list({c["member_id"]: c for c in candidates}.values())
+        out.append({**r, "key_participants": key_participants})
+    return out
+
+
+async def notify_key_participants(db: Prisma, tenant_id: str, payload: NotifyKeyParticipantsInput) -> int:
+    """Only reaches people who actually have a login — a leader without one
+    needs a phone call or a word after service, not a silent no-op, so the
+    count returned is who it actually reached, not who was asked to be."""
+    event = await repository.get_event(db, payload.event_id)
+    colliding = await repository.get_event(db, payload.colliding_event_id)
+    if event is None or colliding is None:
+        raise NotFoundError("No such gathering")
+
+    candidates = await repository.key_participants_for(db, group_ids=[event.group_id, colliding.group_id])
+    wanted = set(payload.member_ids)
+    # A person leading both colliding groups appears once per group here —
+    # dedupe by user, so they get one notification, not two identical ones.
+    notifiable = list({c["user_id"]: c for c in candidates if c["member_id"] in wanted and c["user_id"]}.values())
+
+    event_group = await groups_service.get_group_record(db, event.group_id)
+    colliding_group = await groups_service.get_group_record(db, colliding.group_id)
+    when_a = event.start_date_time.strftime("%a %d %b, %H:%M")
+    when_b = colliding.start_date_time.strftime("%a %d %b, %H:%M")
+    body = (
+        f'Two gatherings you\'re tied to overlap: "{event.title}" ({when_a}, {event_group.name}) and '
+        f'"{colliding.title}" ({when_b}, {colliding_group.name}). Let both group leaders know which one '
+        "you'll be at."
+    )
+    rows = [
+        {
+            "tenant_id": tenant_id,
+            "user_id": c["user_id"],
+            # "notifications_type_check" only allows pastoral_alert/finance_alert/
+            # system/announcement — a dedicated "schedule_conflict" type would
+            # need its own migration and a notification-preferences entry,
+            # which is more than this warranted; "system" is the closest fit.
+            "type": "system",
+            "title": "Scheduling clash — which will you attend?",
+            "body": body,
+            "action_url": f"/staff/events/{event.id}",
+        }
+        for c in notifiable
+    ]
+    await repository.create_notifications(db, rows)
+    return len(rows)
+
+
+# ───────────────────────────── Registration forms ─────────────────────────────
+
+
+async def get_registration_fields(db: Prisma, event_id: str) -> list[dict]:
+    return await repository.list_registration_fields(db, event_id)
+
+
+async def set_registration_fields(db: Prisma, tenant_id: str, event_id: str, fields: list[dict]) -> list[dict]:
+    return await repository.replace_registration_fields(db, tenant_id, event_id, fields)
+
+
+async def list_registrations(db: Prisma, event_id: str) -> list[dict]:
+    return await repository.list_registrations(db, event_id)
+
+
+async def public_event_detail(db: Prisma, slug: str, event_id: str) -> dict:
+    org = await tenant_service.get_live_org_by_slug(db, slug)
+    await set_tenant_context(db, org.id)
+    row = await repository.get_public_event_row(db, event_id)
+    if row is None:
+        raise NotFoundError("No such gathering")
+    decorated = _decorate(row)
+    decorated["registration_fields"] = await repository.list_registration_fields(db, event_id)
+    return decorated
+
+
+async def submit_registration(db: Prisma, slug: str, event_id: str, payload: dict) -> dict:
+    org = await tenant_service.get_live_org_by_slug(db, slug)
+    await set_tenant_context(db, org.id)
+    if await repository.get_public_event_row(db, event_id) is None:
+        raise NotFoundError("No such gathering")
+    fields = await repository.list_registration_fields(db, event_id)
+    answers = payload.get("answers") or {}
+    for field in fields:
+        if not field["required"]:
+            continue
+        value = answers.get(field["label"])
+        empty = (
+            value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, list) and not value)
+        )
+        if empty:
+            raise AppError(f'"{field["label"]}" is required')
+    return await repository.create_registration(db, org.id, event_id, payload)
