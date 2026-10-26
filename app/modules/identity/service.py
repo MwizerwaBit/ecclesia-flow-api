@@ -540,6 +540,41 @@ async def switch_tenant(
     return session
 
 
+async def switch_assignment(
+    db: Prisma,
+    *,
+    user_id: str,
+    current_tenant_id: str | None,
+    membership_id: str,
+    mfa_verified: bool,
+    user_agent: str | None,
+    ip_address: str | None,
+) -> SessionResponse:
+    """Move to another of the caller's own assignments in the SAME church.
+
+    A login can hold several (role, unit scope) pairs in one church; a session
+    works under exactly one at a time. This is deliberately not switch_tenant:
+    it can't hop churches, so a stolen session can't be pointed elsewhere."""
+    await set_user_scope(db, user_id)
+    membership = await repository.get_membership(db, membership_id)
+    if (
+        membership is None
+        or membership.user_id != user_id
+        or membership.status != "active"
+        or current_tenant_id is None
+        or str(membership.tenant_id) != str(current_tenant_id)
+    ):
+        raise NotFoundError("No such assignment for this account in this church")
+    return await switch_tenant(
+        db,
+        user_id=user_id,
+        membership_id=membership_id,
+        mfa_verified=mfa_verified,
+        user_agent=user_agent,
+        ip_address=ip_address,
+    )
+
+
 async def refresh_session(
     db: Prisma, *, raw_refresh_token: str, user_agent: str | None, ip_address: str | None
 ) -> SessionResponse:
@@ -573,6 +608,14 @@ async def refresh_session(
     target = None
     if row.membership_id:
         target = next((m for m in memberships if str(m.id) == row.membership_id), None)
+    if target is None and row.membership_id:
+        # The assignment this session worked under is gone (suspended, say). Stay in the
+        # same church on another of the person's assignments rather than jumping to
+        # whichever church they joined first.
+        old = await repository.get_membership(db, row.membership_id)
+        if old is not None:
+            same_church = [m for m in memberships if str(m.tenant_id) == str(old.tenant_id)]
+            target = next((m for m in same_church if m.is_primary), same_church[0] if same_church else None)
     if target is None:
         target = next((m for m in memberships if m.is_primary), memberships[0] if memberships else None)
 

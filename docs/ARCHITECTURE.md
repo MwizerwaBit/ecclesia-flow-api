@@ -254,9 +254,9 @@ The product architecture brief asks for a lot. Here is where each part stands.
 | Membership lifecycle, history, several units per person | Built within one church |
 | Configurable terminology | Built (labels) |
 | MFA, step-up, session freshness, audit log, rate limiting | Built |
-| **One login holding several roles in one church** (e.g. accountant at parish level *and* priest at one church) | **Not built.** A login has one role and one scope per church (`tenant_memberships` is unique per user and tenant). Needs per-assignment scopes in the token and in `Scope`. This is the next structural change. |
+| **One login holding several roles in one church** (e.g. accountant at parish level *and* priest at one church) | Built as **switchable assignments**: each (role, scope) pair is its own `tenant_memberships` row (unique per user, church, role and scope), and a session works under one at a time (`POST /auth/switch-assignment`; `POST /team/{id}/assignments` adds one). Deliberately *not* a union of scopes in one token, which would mean rewriting `Scope` and every RLS policy around a set instead of a single `app.unit_scope`. Someone who needs both at once uses a role carrying both. |
 | Person ↔ login link as its own entity (`AccountPersonLink`) | Not built. `members.user_id` (unique per church) is the link, and a person exists without a login. Persons are per church on purpose: no global person directory |
-| Family relationships (parent, guardian, spouse) with their own authorization | Not built. Households exist |
+| Family relationships (parent, guardian, spouse) with their own authorization | Built (`modules/family`): recorded by staff; a parent or guardian reaches a child's narrow view only while the child is under 18, a spouse reaches nothing. See AUTHORIZATION_MATRIX |
 | Custom fields and form definitions | Not built |
 | Parent-level access beyond aggregates (e.g. shared reports, specific records under policy) | Not built. Would be new grants backed by new `SECURITY DEFINER` functions, never a tenant session |
 | Tamper-evident audit log | Built — per-organisation hash chain, triggers refuse UPDATE/DELETE/TRUNCATE for every app role, signed checkpoints outside the database ([ADR-0007](adr/0007-tamper-evident-audit-log.md)) |

@@ -182,13 +182,31 @@ a permission:
 | Cancel a leadership transfer | The outgoing leader only | Same channel as initiating it |
 | Disable MFA | The account holder | Removing your own second factor should cost more than a password |
 
+### Family relationships
+
+Recording who is whose parent, guardian or spouse is a people-data write:
+`members:update`, within the usual unit scope, audited (`family.relationship_added`
+/ `_ended`, ids only). What a relationship lets a signed-in person do is a
+separate rule, in `modules/family/service.py`:
+
+| Relationship | Access it grants |
+|---|---|
+| Parent or guardian of someone **under 18** | `GET /me/family/{id}`: contact, emergency contact and group names. Never giving, notes or ID details |
+| Parent or guardian of someone 18 or over, or of someone with no date of birth | None (it ends on the birthday without anyone closing it; unknown age fails closed) |
+| Spouse | None, only recorded |
+| Anyone else's child | 404, identical to a person who doesn't exist |
+
 ## 5. Known gaps
 
-- **One role per login per church.** `tenant_memberships` is unique per
-  `(user_id, tenant_id)` — a person can't hold two different scoped roles
-  in the same church (e.g. whole-church accountant *and* branch-scoped
-  youth leader) today. Tracked as the "next structural change" in
-  [ARCHITECTURE.md](ARCHITECTURE.md) §6.
+- **Several roles per login are alternatives, not a union.** A login can hold
+  several assignments in one church (each a `tenant_memberships` row: one role
+  over one unit scope), but a session works under exactly one at a time and
+  switches with `POST /auth/switch-assignment`. Scopes are never merged: the
+  token, the live check in `deps.py`, `Scope` and RLS all still read a single
+  role and a single scope. Adding one (`POST /team/{id}/assignments`) is
+  checked like any grant (no escalation, a branch actor stays in their branch,
+  administrator and leader roles excluded, the leader's own access untouched).
+  A person who needs both at once uses a role that carries both.
 - **Giving has no ABAC scope.** `Fund`/`DonationBatch`/`Donation`/`Pledge`
   carry no `unit_id`; `finance:*` permissions are tenant-wide regardless of
   branch. See [THREAT_MODEL.md](THREAT_MODEL.md) §3.2.
