@@ -11,7 +11,7 @@ from app.modules.audit.service import write_audit
 from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID
 from app.modules.rbac.service import resolve_permissions
 from app.modules.team import repository
-from app.modules.team.schemas import InviteStaffPayload, UpdateAssignmentPayload
+from app.modules.team.schemas import AddAssignmentPayload, InviteStaffPayload, UpdateAssignmentPayload
 
 
 def _unit_scope_out(row: dict) -> dict:
@@ -83,6 +83,8 @@ async def invite_with_role(
     user = await repository.find_user_by_email(db, email.lower())
     if user is None:
         user = await repository.create_invited_user(db, email=email.lower(), first_name=first_name, last_name=last_name)
+    elif await repository.find_assignment(db, user.id, role_id, unit_scope_id):
+        raise ConflictError("They already have this role over this scope")
 
     # "<tenant>.<secret>" — see identity.service.accept_invite. Only the hash is stored.
     settings = get_settings()
@@ -139,6 +141,57 @@ async def update_assignment(
         await repository.update_assignment(db, membership_id, data)
     row = await repository.get_membership_row(db, membership_id)
     return _unit_scope_out(row)
+
+
+async def add_assignment(
+    db: Prisma,
+    tenant_id: str,
+    membership_id: str,
+    scope: Scope,
+    actor_user_id: str,
+    actor_membership_id: str | None,
+    payload: AddAssignmentPayload,
+) -> dict:
+    """Gives someone already on the team a further (role, unit scope) pair.
+
+    It is a separate login-scoped assignment, not a wider one: the person works
+    in one assignment at a time and switches between them, so a branch role
+    never silently widens into the union of everything they hold. The same
+    guards as any other grant apply, and the leader is excluded (their access
+    changes only through a leadership transfer)."""
+    existing = await repository.get_membership_row(db, membership_id)
+    if existing is None or existing["status"] == "invited":
+        raise NotFoundError("No such team member")
+    if str(existing["user_id"]) == actor_user_id or membership_id == actor_membership_id:
+        raise ForbiddenError("You can't change your own access", code="self_assignment")
+    if existing["is_leader"]:
+        raise ForbiddenError("The church leader's access changes only through a leadership transfer")
+    if payload.role_id in (SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID):
+        raise ForbiddenError("Appoint administrators from Church leadership", code="leader_only")
+    # A branch-scoped actor manages only people already inside their branch.
+    if scope.is_scoped and not scope.unit_writable(existing.get("unit_scope")):
+        raise NotFoundError("No such team member")
+
+    unit = await _check_assignable(db, scope, role_id=payload.role_id, unit_scope=payload.unit_scope)
+    duplicate = await repository.find_assignment(db, str(existing["user_id"]), payload.role_id, unit)
+    if duplicate is not None:
+        raise ConflictError(
+            "They already have this role over this scope"
+            + (" (suspended — reactivate it instead)" if duplicate["status"] == "suspended" else "")
+        )
+    created = await repository.create_assignment(
+        db, user_id=str(existing["user_id"]), tenant_id=tenant_id, role_id=payload.role_id, unit_scope_id=unit
+    )
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=actor_user_id,
+        action="team.assignment_added",
+        resource_type="tenant_membership",
+        resource_id=created.id,
+        metadata={"user_id": str(existing["user_id"]), "role_id": payload.role_id, "unit_scope_id": unit},
+    )
+    return _unit_scope_out(await repository.get_membership_row(db, created.id))
 
 
 # ───────────────────────────── Leadership transfer ─────────────────────────────

@@ -102,7 +102,9 @@ model TenantMembership {
   invite_expires_at DateTime? @db.Timestamptz(6)
   created_at     DateTime  @default(now()) @db.Timestamptz(6)
 
-  @@unique([user_id, tenant_id])
+  // One row per assignment: a login may hold several (role, unit scope) pairs in a church.
+  // Uniqueness of the pair lives in a hand-written expression index (see the migration).
+  @@index([user_id, tenant_id])
   @@map("tenant_memberships")
 }
 
@@ -976,4 +978,23 @@ model OrganizationConfiguration {
   updated_at         DateTime @default(now()) @db.Timestamptz(6)
 
   @@map("organization_configurations")
+}
+
+// A row reads "related_member is the <kind> of member" (kind: parent, guardian,
+// spouse). Spouse pairs are one row with the smaller id first. Closed by
+// ended_on, never deleted. Authorization for acting on a child's behalf lives
+// in app/modules/family; this table only records the fact.
+model MemberRelationship {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  member_id          String    @db.Uuid
+  related_member_id  String    @db.Uuid
+  kind               String
+  started_on         DateTime  @default(now()) @db.Date
+  ended_on           DateTime? @db.Date
+  created_by_user_id String?   @db.Uuid
+  ended_by_user_id   String?   @db.Uuid
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("member_relationships")
 }

@@ -171,6 +171,22 @@ async def switch_tenant(
     return _deliver(request, response, session)
 
 
+@router.post("/switch-assignment", response_model=SessionResponse)
+async def switch_assignment(
+    request: Request, response: Response, payload: SwitchTenantRequest, claims: CurrentClaims, db: PreTenantDb
+):
+    session = await service.switch_assignment(
+        db,
+        user_id=claims.sub,
+        current_tenant_id=claims.tenant_id,
+        membership_id=str(payload.membership_id),
+        mfa_verified=claims.mfa_verified,
+        user_agent=request.headers.get("user-agent"),
+        ip_address=_client_ip(request),
+    )
+    return _deliver(request, response, session)
+
+
 @router.post("/logout", status_code=204)
 async def logout(request: Request, db: PreTenantDb, payload: RefreshRequest | None = None):
     try:

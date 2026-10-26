@@ -19,6 +19,7 @@ from app.modules.affiliations.router import router as affiliations_router
 from app.modules.billing.router import router as billing_router
 from app.modules.certificates.router import public_router as certificates_public_router
 from app.modules.certificates.router import router as certificates_router
+from app.modules.family.router import router as family_router
 from app.modules.finance.router import router as finance_router
 from app.modules.groups.router import router as groups_router
 from app.modules.hierarchy.router import router as hierarchy_router
@@ -50,6 +51,7 @@ BUSINESS = [
     people_router,
     households_router,
     membership_router,
+    family_router,
     groups_router,
     portal_router,
     activity_router,
