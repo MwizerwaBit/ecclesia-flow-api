@@ -16,8 +16,9 @@ from prisma import Prisma
 
 from app.core.config import get_settings
 from app.core.database import platform_session
+from app.core.entitlement import Access, load_access
 from app.core.exceptions import AppError, ConflictError, NotFoundError
-from app.modules.billing import repository, signatures
+from app.modules.billing import manual, repository, signatures
 from app.modules.billing.providers import CheckoutRequest, DemoProvider, get_provider, provider_by_name
 from app.modules.billing.schemas import CheckoutInput, DemoPayInput
 from app.modules.identity import service as identity_service
@@ -36,6 +37,7 @@ class PaymentDeclinedError(AppError):
 
 
 def list_plans() -> list[dict]:
+    currency = get_settings().billing_currency
     return [
         {
             "tier": p.tier,
@@ -46,9 +48,30 @@ def list_plans() -> list[dict]:
             "max_members": p.max_members,
             "modules": [m.id for m in MODULES if tier_at_least(p.tier, m.min_tier)],
             "purchasable": p.tier in PURCHASABLE_TIERS,
+            "currency": currency,
         }
         for p in PLANS
     ]
+
+
+def access_dict(access: Access | None, payment_pending: bool = False) -> dict | None:
+    if access is None:
+        return None
+    return {
+        "state": access.state,
+        "tier": access.tier,
+        "can_write": access.can_write,
+        "period_end": access.period_end,
+        "grace_ends_at": access.grace_ends_at,
+        "days_left": access.days_left,
+        "renewal_due": access.renewal_due,
+        "payment_pending": payment_pending,
+    }
+
+
+async def access_for(db: Prisma, access: Access | None) -> dict | None:
+    """The access summary any signed-in person of the church may see."""
+    return access_dict(access, payment_pending=access is not None and await manual.has_pending(db))
 
 
 async def overview(db: Prisma, org_id: str) -> dict:
@@ -56,7 +79,12 @@ async def overview(db: Prisma, org_id: str) -> dict:
     org = await org_service.get_profile(db, org_id)
     subscription = await repository.get_subscription(db, org_id)
     payments = await repository.list_payments(db, org_id)
+    access = await load_access(db, org_id)
+    recent = await manual.list_for_church(db, limit=5)
     return {
+        "access": access_dict(access, payment_pending=any(p["status"] == "pending" for p in recent)),
+        "pending_payment": next((p for p in recent if p["status"] == "pending"), None),
+        "last_payment": next((p for p in recent if p["status"] != "pending"), None),
         "provider": settings.billing_provider,
         "publishable_key": settings.stripe_publishable_key or None,
         "org_status": org.status,
@@ -71,6 +99,8 @@ async def create_checkout(db: Prisma, org_id: str, user_id: str, payload: Checko
     user = await identity_service.get_active_user(db, user_id)
     if org.status == "canceled":
         raise ConflictError("This church's account is closed")
+    if get_settings().billing_provider == "manual":
+        raise ConflictError("Pay by mobile money from the Billing page", code="use_manual_payment")
     plan = PLAN_BY_TIER[payload.tier]
     amount = plan.price(payload.interval)
     settings = get_settings()

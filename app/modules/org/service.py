@@ -7,6 +7,7 @@ from prisma import Prisma
 
 from app.core import private_storage
 from app.core.authz import Scope
+from app.core.entitlement import load_access
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.modules.audit.service import write_audit
 from app.modules.org import repository
@@ -67,8 +68,11 @@ async def update_profile(db: Prisma, org_id: str, actor_user_id: str, payload: O
 async def get_subscription(db: Prisma, org_id: str) -> dict:
     org = await _org_or_404(db, org_id)
     overrides = await repository.list_module_overrides(db, org_id)
+    # A church that isn't paid up is shown as free-tier, so the paid modules
+    # lock in the app exactly as the API locks them (billing/entitlement.py).
+    access = await load_access(db, org_id)
     return {
-        "tier": org.tier,
+        "tier": access.tier if access is not None else org.tier,
         "overrides": {o.module_id: o.enabled for o in overrides},
         "platform_managed": sorted(o.module_id for o in overrides if o.set_by_platform),
     }

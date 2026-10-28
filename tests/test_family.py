@@ -177,3 +177,31 @@ async def test_relationships_do_not_cross_churches_or_skip_permissions(client, c
     headers = auth(joined["access_token"])
     assert (await client.get(f"/api/v1/members/{mine['id']}/relationships", headers=headers)).status_code == 403
     assert (await _relate(client, headers, mine["id"], joined_member["id"], "spouse")).status_code == 403
+
+
+async def test_a_title_given_on_joining_is_kept_and_shown(client, church_payload):
+    _, leader, lead = await _church(client, church_payload, "title")
+    slug = (await client.get("/api/v1/org/profile", headers=lead)).json()["slug"]
+    resp = await client.post(
+        "/api/v1/auth/join",
+        json={
+            "church_slug": slug,
+            "title": "  Prophet ",
+            "first_name": "Titled",
+            "last_name": "Person",
+            "email": f"titled.{leader['user']['id'][:6]}@example-church.org",
+            "password": "JoinChurch2026",
+            "phone": "+250788333444",
+            "gender": "male",
+            "date_of_birth": "1980-01-01",
+            "national_id": "TITLE0001",
+            "consent_data_processing": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    me = (await client.get("/api/v1/me/member", headers=auth(resp.json()["access_token"]))).json()
+    assert me["title"] == "Prophet"  # trimmed
+    # And it comes back in the directory list, so a title can sit beside the name anywhere.
+    listing = (await client.get("/api/v1/members?search=Titled", headers=lead)).json()
+    rows = listing["items"] if isinstance(listing, dict) else listing
+    assert any(r["id"] == me["id"] and r["title"] == "Prophet" for r in rows)

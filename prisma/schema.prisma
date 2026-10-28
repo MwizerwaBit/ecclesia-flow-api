@@ -804,10 +804,38 @@ model BillingSubscription {
   provider_customer_id     String?
   provider_subscription_id String?
   current_period_end       DateTime? @db.Timestamptz(6)
+  renewal_reminder_for     DateTime? @db.Timestamptz(6)
   created_at               DateTime  @default(now()) @db.Timestamptz(6)
   updated_at               DateTime  @default(now()) @db.Timestamptz(6)
 
   @@map("billing_subscriptions")
+}
+
+model BillingManualPayment {
+  id                   String    @id @default(uuid()) @db.Uuid
+  tenant_id            String    @db.Uuid
+  tier                 String
+  months               Int
+  amount_cents         Int
+  currency             String
+  reference_code       String    @unique
+  sender_name          String
+  sent_amount_cents    Int
+  momo_transaction_id  String?
+  proof_storage_key    String
+  proof_mime_type      String
+  proof_size_bytes     Int
+  proof_sha256         String
+  status               String    @default("pending")
+  submitted_by_user_id String    @db.Uuid
+  submitted_at         DateTime  @default(now()) @db.Timestamptz(6)
+  decided_by_user_id   String?   @db.Uuid
+  decided_at           DateTime? @db.Timestamptz(6)
+  decision_note        String?
+  granted_from         DateTime? @db.Timestamptz(6)
+  granted_until        DateTime? @db.Timestamptz(6)
+
+  @@map("billing_manual_payments")
 }
 
 model BillingCheckoutSession {

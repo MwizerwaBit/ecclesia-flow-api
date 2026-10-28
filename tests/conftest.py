@@ -5,6 +5,7 @@ import uuid
 # a live church, so they start active here; test_lifecycle switches this off
 # to exercise the real registration → payment → activation path.
 os.environ.setdefault("DEV_AUTO_ACTIVATE_ORGS", "true")
+os.environ.setdefault("RUN_BACKGROUND_JOBS", "false")
 
 import pytest
 from httpx import ASGITransport, AsyncClient

@@ -16,6 +16,15 @@ from fastapi import Depends, Header, Request
 from prisma import Prisma
 
 from app.core.database import platform_session, tenant_session, unscoped_tenant_session
+from app.core.entitlement import (
+    FULL,
+    VIEW_ONLY,
+    Access,
+    ModuleLockedError,
+    SubscriptionRequiredError,
+    load_access,
+    refuse_if_closed,
+)
 from app.core.exceptions import AppError, ForbiddenError, StepUpRequiredError, UnauthorizedError
 from app.core.permissions import MFA_REQUIRED_PERMISSIONS
 from app.core.security import AccessTokenClaims, TokenError, TokenType, decode_token
@@ -102,22 +111,45 @@ class OrgInactiveError(AppError):
     code = "org_inactive"
 
 
-async def require_active_org(claims: CurrentClaims, db: TenantDb) -> None:
-    """Business data is for churches that are live. A pending church can sign
-    in, finish onboarding and pay (those routers don't use this guard); a
-    suspended or closed one can still reach billing and support, nothing else.
-    Platform admins impersonating a church are let through to help it."""
+async def get_access(claims: CurrentClaims, db: TenantDb) -> Access | None:
+    """The church's current entitlement. A dependency, so a route that needs it
+    in several places (the guard below and a module gate) pays for one query."""
     if claims.is_platform_admin:
+        return None
+    access = await load_access(db, claims.tenant_id)
+    if access is None:
+        raise ForbiddenError("This church's account is closed", code="org_closed")
+    return access
+
+
+CurrentAccess = Annotated[Access | None, Depends(get_access)]
+
+
+async def require_active_org(request: Request, access: CurrentAccess) -> None:
+    """Business data follows the church's paid state (billing/entitlement.py).
+    Suspended and closed churches reach billing and support, nothing else.
+    Past the grace days a church is view-only: reads pass, changes get a 402.
+    Platform admins impersonating a church are let through to help it."""
+    if access is None:
         return
-    rows = await db.query_raw("select status from organizations where id = $1::uuid", claims.tenant_id)
-    status = rows[0]["status"] if rows else None
-    if status in ("active", "trial"):
-        return
-    if status == "pending":
-        raise OrgInactiveError("Your church isn't active yet — complete payment or wait for activation")
-    if status == "suspended":
-        raise ForbiddenError("This church is suspended. Contact EcclesiaFlow support.", code="org_suspended")
-    raise ForbiddenError("This church's account is closed", code="org_closed")
+    refuse_if_closed(access)
+    if access.state == VIEW_ONLY and request.method not in ("GET", "HEAD", "OPTIONS"):
+        raise SubscriptionRequiredError(
+            "Your church's plan has ended, so it is view-only. Renew to add or change things."
+        )
+
+
+def require_module(name: str, *, free: bool) -> Callable:
+    """Attach to a router whose screens belong to one module. While a church is
+    not paid up, only the free modules work; the rest answer 402 `module_locked`.
+    (`free`: the module is part of the free tier; the catalogue says which.)"""
+
+    async def _check(access: CurrentAccess) -> None:
+        if access is None or access.state == FULL or free:
+            return
+        raise ModuleLockedError(f"{name} is locked until your church's plan is paid")
+
+    return _check
 
 
 async def get_pre_tenant_db() -> AsyncGenerator[Prisma, None]:
