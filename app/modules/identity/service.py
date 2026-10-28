@@ -303,6 +303,7 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
             org.id,
             {
                 "user_id": user.id,
+                "title": (payload.title or "").strip() or None,
                 "first_name": payload.first_name.strip(),
                 "last_name": payload.last_name.strip(),
                 "email": payload.email.lower(),

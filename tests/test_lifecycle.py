@@ -19,6 +19,7 @@ PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 @pytest.fixture(autouse=True)
 def _real_lifecycle(monkeypatch):
     monkeypatch.setattr(get_settings(), "dev_auto_activate_orgs", False)
+    monkeypatch.setattr(get_settings(), "payment_method", "demo")  # the card path; see test_manual_payments
 
 
 async def _register(client, church_payload, label, **extra):
@@ -32,10 +33,11 @@ async def test_new_church_is_pending_until_it_pays_and_then_activates_automatica
     _, session = await _register(client, church_payload, "pay")
     h = auth(session["access_token"])
 
-    # Pending: onboarding works, the church's data doesn't.
-    blocked = await client.get("/api/v1/members", headers=h)
+    # Pending: onboarding works; free basics too, but the paid modules are locked.
+    assert (await client.get("/api/v1/members", headers=h)).status_code == 200
+    blocked = await client.get("/api/v1/finance/funds", headers=h)
     assert blocked.status_code == 402
-    assert blocked.json()["error"]["code"] == "org_inactive"
+    assert blocked.json()["error"]["code"] == "module_locked"
     onboarding = (await client.get("/api/v1/org/onboarding", headers=h)).json()
     assert onboarding["org_status"] == "pending" and onboarding["is_active"] is False
     assert {s["key"]: s["state"] for s in onboarding["steps"]}["payment"] == "todo"

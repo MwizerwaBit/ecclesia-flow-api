@@ -102,3 +102,11 @@ def read(storage_key: str, expected_sha256: str) -> bytes:
     if hashlib.sha256(data).hexdigest() != expected_sha256:
         raise AppError("The stored file failed its integrity check", code="integrity_error")
     return data
+
+
+def discard(storage_key: str) -> None:
+    """Removes a file whose database row was never written."""
+    root = _root()
+    path = (root / storage_key).resolve()
+    if root in path.parents:
+        path.unlink(missing_ok=True)
