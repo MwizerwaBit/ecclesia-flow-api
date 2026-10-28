@@ -12,13 +12,14 @@ decision — keep this file the single place it is made:
 
 from fastapi import APIRouter, Depends
 
-from app.core.deps import require_active_org
+from app.core.deps import require_active_org, require_module
 from app.modules.activity.router import public_router as events_public_router
 from app.modules.activity.router import router as activity_router
 from app.modules.affiliations.router import router as affiliations_router
 from app.modules.billing.router import router as billing_router
 from app.modules.certificates.router import public_router as certificates_public_router
 from app.modules.certificates.router import router as certificates_router
+from app.modules.family.router import router as family_router
 from app.modules.finance.router import router as finance_router
 from app.modules.groups.router import router as groups_router
 from app.modules.hierarchy.router import router as hierarchy_router
@@ -27,7 +28,9 @@ from app.modules.leadership.router import router as leadership_router
 from app.modules.media.router import router as media_router
 from app.modules.membership.router import router as membership_router
 from app.modules.messaging.router import router as messaging_router
+from app.modules.org.catalogue import MODULE_BY_ID, tier_at_least
 from app.modules.org.router import router as org_router
+from app.modules.payment_approvals.router import router as billing_platform_router
 from app.modules.people.router import households_router
 from app.modules.people.router import router as people_router
 from app.modules.platform_admin.router import router as platform_admin_router
@@ -40,28 +43,36 @@ PUBLIC = [identity_router, tenant_router, certificates_public_router, events_pub
 ALWAYS_ON = [
     org_router,
     billing_router,
+    billing_platform_router,
     team_router,
     rbac_router,
     hierarchy_router,
     leadership_router,
     platform_admin_router,
 ]
+#: Each business router with the module it belongs to (None: not a paid module).
+#: While a church isn't paid up, only the free modules answer (require_module).
 BUSINESS = [
-    people_router,
-    households_router,
-    membership_router,
-    groups_router,
-    portal_router,
-    activity_router,
-    finance_router,
-    messaging_router,
-    media_router,
-    certificates_router,
-    affiliations_router,
+    (people_router, "people"),
+    (households_router, "people"),
+    (membership_router, "people"),
+    (family_router, "people"),
+    (groups_router, "people"),
+    (portal_router, None),
+    (activity_router, "gatherings"),
+    (finance_router, "giving"),
+    (messaging_router, "communications"),
+    (media_router, "media"),
+    (certificates_router, "certificates"),
+    (affiliations_router, "hierarchy"),
 ]
 
 api_router = APIRouter(prefix="/api/v1")
 for router in PUBLIC + ALWAYS_ON:
     api_router.include_router(router)
-for router in BUSINESS:
-    api_router.include_router(router, dependencies=[Depends(require_active_org)])
+for router, module_id in BUSINESS:
+    guards = [Depends(require_active_org)]
+    if module_id:
+        module = MODULE_BY_ID[module_id]
+        guards.append(Depends(require_module(module.name, free=tier_at_least("free", module.min_tier))))
+    api_router.include_router(router, dependencies=guards)

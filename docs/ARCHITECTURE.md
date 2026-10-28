@@ -8,7 +8,12 @@ records which parts of the target architecture are deliberately not built yet.
 Related docs: [adr/](adr/) (decisions) · [API_STANDARDS.md](API_STANDARDS.md) ·
 [CONTRIBUTING.md](CONTRIBUTING.md) · [MIGRATIONS.md](MIGRATIONS.md) ·
 [OPERATIONS.md](OPERATIONS.md) · [SECURE_DEVELOPMENT.md](SECURE_DEVELOPMENT.md) ·
-[SECURITY_NOTES.md](SECURITY_NOTES.md)
+[SECURITY_NOTES.md](SECURITY_NOTES.md) · [THREAT_MODEL.md](THREAT_MODEL.md) ·
+[AUTHORIZATION_MATRIX.md](AUTHORIZATION_MATRIX.md) ·
+[DATA_CLASSIFICATION.md](DATA_CLASSIFICATION.md) ·
+[SECURITY_VERIFICATION_MATRIX.md](SECURITY_VERIFICATION_MATRIX.md) ·
+[INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md) ·
+[PRIVACY_COMPLIANCE.md](PRIVACY_COMPLIANCE.md)
 
 The short version: **a modular monolith on one PostgreSQL database.**
 Organisation structure, identity, membership, permissions and product modules
@@ -37,10 +42,27 @@ prisma/
   migrations/        hand-written SQL: FKs, checks, RLS, triggers, functions
 ```
 
-Dependencies point inward: router → service → repository. A module talks to
-another module's data through that module's service or repository, never by
-writing to its tables directly. The exception is read-only joins for display,
-such as a unit name next to a member.
+### 1a. Layers and rules (MVC, [ADR-0009](adr/0009-mvc-layering-and-boundary-tests.md))
+
+| Layer | File | May depend on | Must not |
+|---|---|---|---|
+| Controller | `router.py` | its own `service`, `schemas`, `app.core` (auth deps, `authz` guards, pagination) | touch the database, import any repository, hold business rules |
+| Application / domain | `service.py` (+ helpers like `lifecycle.py`) | its own `repository`, other modules' **services** and **schemas**, `app.core` | import FastAPI, import another module's repository or router |
+| Persistence (model) | `repository.py` | Prisma client, `app.core` | contain business decisions |
+| DTOs | `schemas.py` | Pydantic, other schemas | import services or repositories |
+| Infrastructure / policy | `app/core/*` | nothing in `app/modules` | — (raw SQL allowed for RLS context and ABAC attribute lookups) |
+| View | the frontend (`ecclesia-flow-app`) | the HTTP API only | — |
+
+```
+HTTP ──▶ router (controller) ──▶ service ──▶ repository ──▶ PostgreSQL (constraints, RLS, triggers)
+            │                        │
+            └──▶ app/core (auth, authz, pagination, limits) ◀──┘
+```
+
+`tests/test_architecture.py` enforces these rules on every run. Violations
+that existed before the rules are listed there, and the list only shrinks.
+Read-only joins for display, such as a unit name next to a member, are fine
+inside a repository query.
 
 ### Modules
 
@@ -226,15 +248,16 @@ The product architecture brief asks for a lot. Here is where each part stands.
 |---|---|
 | Modular monolith, one Postgres, module boundaries | Built |
 | Tenant isolation, app + RLS, non-owner runtime role, fail-closed context | Built |
-| Unit-level isolation in the database | Built for people data. Groups, events, attendance and giving are still unit-scoped by the application only |
+| Unit-level isolation in the database | Built for people data, groups, events and attendance. Giving (funds, batches, donations, pledges) is still unit-scoped by the application only — none of those tables carry a `unit_id`, so there's no column to scope on without a schema change |
 | Configurable hierarchy, unit types, cycle-safe moves | Built |
 | Later affiliation with governed, consented parent visibility | Built (counts and shared gatherings) |
 | Membership lifecycle, history, several units per person | Built within one church |
 | Configurable terminology | Built (labels) |
 | MFA, step-up, session freshness, audit log, rate limiting | Built |
-| **One login holding several roles in one church** (e.g. accountant at parish level *and* priest at one church) | **Not built.** A login has one role and one scope per church (`tenant_memberships` is unique per user and tenant). Needs per-assignment scopes in the token and in `Scope`. This is the next structural change. |
+| **One login holding several roles in one church** (e.g. accountant at parish level *and* priest at one church) | Built as **switchable assignments**: each (role, scope) pair is its own `tenant_memberships` row (unique per user, church, role and scope), and a session works under one at a time (`POST /auth/switch-assignment`; `POST /team/{id}/assignments` adds one). Deliberately *not* a union of scopes in one token, which would mean rewriting `Scope` and every RLS policy around a set instead of a single `app.unit_scope`. Someone who needs both at once uses a role carrying both. |
 | Person ↔ login link as its own entity (`AccountPersonLink`) | Not built. `members.user_id` (unique per church) is the link, and a person exists without a login. Persons are per church on purpose: no global person directory |
-| Family relationships (parent, guardian, spouse) with their own authorization | Not built. Households exist |
+| Family relationships (parent, guardian, spouse) with their own authorization | Built (`modules/family`): recorded by staff; a parent or guardian reaches a child's narrow view only while the child is under 18, a spouse reaches nothing. See AUTHORIZATION_MATRIX |
 | Custom fields and form definitions | Not built |
 | Parent-level access beyond aggregates (e.g. shared reports, specific records under policy) | Not built. Would be new grants backed by new `SECURITY DEFINER` functions, never a tenant session |
-| Tamper-evident audit log, retention policies | Not built. `audit_logs` is append-only by convention |
+| Tamper-evident audit log | Built — per-organisation hash chain, triggers refuse UPDATE/DELETE/TRUNCATE for every app role, signed checkpoints outside the database ([ADR-0007](adr/0007-tamper-evident-audit-log.md)) |
+| Audit log retention policy | Not built. The chain is append-only forever; no row is ever pruned |

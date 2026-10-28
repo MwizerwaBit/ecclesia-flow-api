@@ -33,13 +33,32 @@ How to add a module: ARCHITECTURE.md §5.
 
 ## Branching and commits
 
-- `master` is always releasable. It is protected: no direct pushes, and CI
-  must pass (FORYOU.md has the settings).
-- Work on short-lived branches named `<type>/<short-description>`, such as
+Three long-lived branches, promoted in one direction only:
+
+```
+feat/… fix/… chore/…  ──PR──▶  development  ──PR──▶  staging  ──PR──▶  master
+      (short-lived)            (integration)        (release candidate,  (production;
+                                                     deploys to staging)  tagged releases)
+```
+
+- **`development`** is where work lands. Branch from it and open your PR
+  back into it.
+- **`staging`** gets `development` when a set of changes is ready to try on
+  the staging environment. Nothing is committed to it directly.
+- **`master`** is production. It only receives `staging` once that set has
+  passed on staging, and releases are tagged from it
+  ([OPERATIONS.md](OPERATIONS.md#release)). All three branches are protected:
+  no direct pushes, and CI must pass (FORYOU.md has the settings).
+- **Hotfix:** branch `hotfix/…` from `master`, open a PR into `master`, then
+  merge `master` back into `staging` and `development` so the fix isn't lost.
+- Name working branches `<type>/<short-description>`, for example
   `feat/password-reset`, `fix/media-type-check` or `docs/adr-0008`.
 - Write commit messages in the imperative ("Add password reset"), with a body
   explaining why when that isn't obvious. Reference the TODO.md id (`DIF-07`).
-- Squash-merge pull requests so `master` has one commit per change.
+- Squash-merge working branches into `development` (one commit per change).
+  Promotions (`development` → `staging` → `master`) use a **merge commit**,
+  not a squash, so the branches keep a shared history and later promotions
+  stay conflict-free.
 
 ## Pull requests and review
 

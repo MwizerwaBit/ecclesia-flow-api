@@ -2,10 +2,8 @@ from fastapi import APIRouter, Depends, Query
 
 from app.core.deps import PlatformClaims, PlatformDb, require_platform_admin_level
 from app.core.pagination import PaginatedRoute
-from app.modules.audit.service import write_audit
+from app.core.responses import attachment_response
 from app.modules.billing.schemas import BillingOverview
-from app.modules.org import service as org_service
-from app.modules.org.router import document_response
 from app.modules.org.schemas import ModuleSubscription, OrgDocumentRead, SetModuleInput, SetTierInput
 from app.modules.platform_admin import service
 from app.modules.platform_admin.schemas import (
@@ -133,16 +131,8 @@ async def list_org_documents(org_id: str, db: PlatformDb):
 
 @router.get("/orgs/{org_id}/documents/{document_id}/download")
 async def download_org_document(org_id: str, document_id: str, claims: PlatformClaims, db: PlatformDb):
-    data, mime, name = await service.read_org_document(db, org_id, document_id)
-    await write_audit(
-        db,
-        tenant_id=None,
-        actor_user_id=claims.sub,
-        action="org.certificate_downloaded",
-        resource_type="org_document",
-        resource_id=document_id,
-    )
-    return document_response(data, mime, name)
+    data, mime, name = await service.download_org_document(db, claims.sub, org_id, document_id)
+    return attachment_response(data, mime, name)
 
 
 @router.post("/orgs/{org_id}/documents/{document_id}/review", response_model=list[OrgDocumentRead], dependencies=FULL)
@@ -159,26 +149,14 @@ async def org_billing(org_id: str, db: PlatformDb):
 
 @router.get("/orgs/{org_id}/modules", response_model=ModuleSubscription)
 async def org_modules(org_id: str, db: PlatformDb):
-    return await org_service.get_subscription(db, org_id)
+    return await service.org_modules(db, org_id)
 
 
 @router.put("/orgs/{org_id}/modules/tier", response_model=ModuleSubscription, dependencies=FULL)
 async def set_org_tier(org_id: str, payload: SetTierInput, claims: PlatformClaims, db: PlatformDb):
-    await db.organization.update(where={"id": org_id}, data={"tier": payload.tier})
-    await write_audit(
-        db,
-        tenant_id=org_id,
-        actor_user_id=claims.sub,
-        action="org.tier_set_by_platform",
-        resource_type="organization",
-        resource_id=org_id,
-        metadata={"tier": payload.tier},
-    )
-    return await org_service.get_subscription(db, org_id)
+    return await service.set_org_tier(db, claims.sub, org_id, payload.tier)
 
 
 @router.put("/orgs/{org_id}/modules/{module_id}", response_model=ModuleSubscription, dependencies=FULL)
 async def set_org_module(org_id: str, module_id: str, payload: SetModuleInput, claims: PlatformClaims, db: PlatformDb):
-    return await org_service.set_module(
-        db, org_id, module_id, payload.enabled, actor_user_id=claims.sub, by_platform=True
-    )
+    return await service.set_org_module(db, claims.sub, org_id, module_id, payload.enabled)

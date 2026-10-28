@@ -102,7 +102,9 @@ model TenantMembership {
   invite_expires_at DateTime? @db.Timestamptz(6)
   created_at     DateTime  @default(now()) @db.Timestamptz(6)
 
-  @@unique([user_id, tenant_id])
+  // One row per assignment: a login may hold several (role, unit scope) pairs in a church.
+  // Uniqueness of the pair lives in a hand-written expression index (see the migration).
+  @@index([user_id, tenant_id])
   @@map("tenant_memberships")
 }
 
@@ -134,6 +136,22 @@ model PasswordResetToken {
   created_at   DateTime  @default(now()) @db.Timestamptz(6)
 
   @@map("password_reset_tokens")
+}
+
+// One row per MFA challenge token (its jti), so the same challenge can't be
+// replayed with different codes beyond a capped number of attempts, and
+// can't be reused at all once it succeeds. Like refresh_tokens: account-level,
+// not tenant data, so no RLS (SA-10 — MFA challenge tokens are single-use).
+model MfaChallengeAttempt {
+  id            String    @id @default(uuid()) @db.Uuid
+  jti           String    @unique
+  user_id       String    @db.Uuid
+  attempt_count Int       @default(0)
+  consumed_at   DateTime? @db.Timestamptz(6)
+  expires_at    DateTime  @db.Timestamptz(6)
+  created_at    DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("mfa_challenge_attempts")
 }
 
 // ───────────────────────────── RBAC + ABAC ─────────────────────────────
@@ -269,6 +287,13 @@ model Member {
   national_id_hash               String?
   national_id_encrypted          String?
   national_id_last4              String?
+  // Pastoral follow-up (a visitor who hasn't been reached, a member not seen
+  // recently): who is on it, and whether it's done. Reusable across both —
+  // only the visitor-followups screen writes to it today.
+  followup_assigned_to_user_id String?   @db.Uuid
+  followup_assigned_at         DateTime? @db.Timestamptz(6)
+  followup_resolved_at         DateTime? @db.Timestamptz(6)
+  followup_note                String?
   created_at                 DateTime  @default(now()) @db.Timestamptz(6)
   updated_at                 DateTime  @updatedAt @db.Timestamptz(6)
 
@@ -779,10 +804,38 @@ model BillingSubscription {
   provider_customer_id     String?
   provider_subscription_id String?
   current_period_end       DateTime? @db.Timestamptz(6)
+  renewal_reminder_for     DateTime? @db.Timestamptz(6)
   created_at               DateTime  @default(now()) @db.Timestamptz(6)
   updated_at               DateTime  @default(now()) @db.Timestamptz(6)
 
   @@map("billing_subscriptions")
+}
+
+model BillingManualPayment {
+  id                   String    @id @default(uuid()) @db.Uuid
+  tenant_id            String    @db.Uuid
+  tier                 String
+  months               Int
+  amount_cents         Int
+  currency             String
+  reference_code       String    @unique
+  sender_name          String
+  sent_amount_cents    Int
+  momo_transaction_id  String?
+  proof_storage_key    String
+  proof_mime_type      String
+  proof_size_bytes     Int
+  proof_sha256         String
+  status               String    @default("pending")
+  submitted_by_user_id String    @db.Uuid
+  submitted_at         DateTime  @default(now()) @db.Timestamptz(6)
+  decided_by_user_id   String?   @db.Uuid
+  decided_at           DateTime? @db.Timestamptz(6)
+  decision_note        String?
+  granted_from         DateTime? @db.Timestamptz(6)
+  granted_until        DateTime? @db.Timestamptz(6)
+
+  @@map("billing_manual_payments")
 }
 
 model BillingCheckoutSession {
@@ -890,6 +943,37 @@ model EventReview {
   @@map("event_reviews")
 }
 
+// Custom registration questions attached to an event, shown on its public
+// share link before someone RSVPs. Answers are captured against the field's
+// label at submission time (see EventRegistration.answers), not a field id,
+// so editing or removing a question later never corrupts an existing response.
+model EventRegistrationField {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenant_id  String   @db.Uuid
+  event_id   String   @db.Uuid
+  label      String
+  field_type String // 'text' | 'single_choice' | 'checkbox'
+  options    String[] @default([])
+  required   Boolean  @default(false)
+  position   Int
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("event_registration_fields")
+}
+
+model EventRegistration {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenant_id        String   @db.Uuid
+  event_id         String   @db.Uuid
+  respondent_name  String
+  respondent_email String?
+  respondent_phone String?
+  answers          Json     @default("{}")
+  created_at       DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("event_registrations")
+}
+
 // ───────────────────────────── Organisation structure ─────────────────────────────
 
 // An independently registered church joining a parent organisation. Not
@@ -922,4 +1006,23 @@ model OrganizationConfiguration {
   updated_at         DateTime @default(now()) @db.Timestamptz(6)
 
   @@map("organization_configurations")
+}
+
+// A row reads "related_member is the <kind> of member" (kind: parent, guardian,
+// spouse). Spouse pairs are one row with the smaller id first. Closed by
+// ended_on, never deleted. Authorization for acting on a child's behalf lives
+// in app/modules/family; this table only records the fact.
+model MemberRelationship {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  member_id          String    @db.Uuid
+  related_member_id  String    @db.Uuid
+  kind               String
+  started_on         DateTime  @default(now()) @db.Date
+  ended_on           DateTime? @db.Date
+  created_by_user_id String?   @db.Uuid
+  ended_by_user_id   String?   @db.Uuid
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@map("member_relationships")
 }

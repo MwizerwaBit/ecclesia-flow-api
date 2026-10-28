@@ -4,6 +4,7 @@ from prisma import Prisma
 
 from app.core.exceptions import ConflictError, NotFoundError
 from app.modules.audit.service import write_audit
+from app.modules.org import service as org_service
 from app.modules.platform_admin import repository
 from app.modules.platform_admin.models import FEATURE_CATALOGUE, tier_default_enabled
 from app.modules.platform_admin.schemas import (
@@ -60,17 +61,7 @@ async def create_org(db: Prisma, admin_user_id: str, payload: CreateOrgInput) ->
     from app.modules.rbac.models import SYSTEM_ROLE_LEADER_ID
     from app.modules.team import service as team_service
 
-    await db.organization.update(
-        where={"id": org.id},
-        data={
-            "status": "active",
-            "tier": payload.tier,
-            "activated_at": datetime.now(UTC),
-            "activation_source": "platform_admin",
-            "activation_note": "Registered by EcclesiaFlow",
-            "trial_ends_at": datetime.now(UTC) + timedelta(days=payload.trial_days),
-        },
-    )
+    await org_service.mark_registered_by_platform(db, org_id=org.id, tier=payload.tier, trial_days=payload.trial_days)
     name_parts = payload.primary_admin_name.split(" ", 1)
     invited = await team_service.invite_with_role(
         db,
@@ -264,7 +255,7 @@ async def get_platform_metrics(db: Prisma) -> dict:
 
 
 async def get_system_health(db: Prisma) -> dict:
-    active_sessions = await db.refreshtoken.count(where={"revoked_at": None, "expires_at": {"gt": datetime.now(UTC)}})
+    active_sessions = await repository.count_active_sessions(db)
     return {
         "services": [
             {"name": "API", "status": "operational", "detail": "Responding normally"},
@@ -290,11 +281,10 @@ IMPERSONATION_RESTRICTED_PERMISSIONS = {
 
 async def start_impersonation(db: Prisma, admin_user_id: str, org_id: str, payload: ImpersonationRequest) -> dict:
     from app.core.security import create_access_token
-    from app.modules.rbac import repository as rbac_repository
-    from app.modules.rbac.service import resolve_permissions
+    from app.modules.rbac.service import get_system_role_by_name, resolve_permissions
 
     org = await get_org(db, org_id)
-    role = await rbac_repository.get_system_role_by_name(db, payload.role_to_impersonate)
+    role = await get_system_role_by_name(db, payload.role_to_impersonate)
     if role is None:
         raise NotFoundError(f"No such role: {payload.role_to_impersonate}")
     permissions = await resolve_permissions(db, role.id)
@@ -371,51 +361,43 @@ async def activate_org(db: Prisma, admin_user_id: str, org_id: str, note: str) -
 
 
 async def list_org_documents(db: Prisma, org_id: str) -> list[dict]:
-    from app.modules.org import repository as org_repository
-
     await get_org(db, org_id)
-    return await org_repository.list_documents(db, org_id)
+    return await org_service.list_documents(db, org_id)
 
 
-async def read_org_document(db: Prisma, org_id: str, document_id: str):
-    from app.modules.org import service as org_service
-
-    return await org_service.read_document(db, org_id, document_id)
+async def download_org_document(db: Prisma, admin_user_id: str, org_id: str, document_id: str):
+    """The file plus an audit entry: platform staff reading a church's
+    official document is always recorded."""
+    data, mime, name = await org_service.read_document(db, org_id, document_id)
+    await write_audit(
+        db,
+        tenant_id=None,
+        actor_user_id=admin_user_id,
+        action="org.certificate_downloaded",
+        resource_type="org_document",
+        resource_id=document_id,
+    )
+    return data, mime, name
 
 
 async def review_org_document(
     db: Prisma, admin_user_id: str, org_id: str, document_id: str, decision: str, note: str | None
 ):
-    from datetime import UTC
-    from datetime import datetime as dt
-
-    from app.modules.org import repository as org_repository
-
-    doc = await org_repository.get_document(db, org_id, document_id)
-    if doc is None:
-        raise NotFoundError("No such document")
-    if doc.status != "pending_review":
-        raise ConflictError("This document has already been reviewed or replaced")
-    await db.orgdocument.update(
-        where={"id": document_id},
-        data={
-            "status": decision,
-            "reviewed_by_user_id": admin_user_id,
-            "reviewed_at": dt.now(UTC),
-            "review_note": note,
-        },
+    return await org_service.review_document(
+        db, admin_user_id=admin_user_id, org_id=org_id, document_id=document_id, decision=decision, note=note
     )
-    await db.organization.update(where={"id": org_id}, data={"verification_status": decision})
-    await write_audit(
-        db,
-        tenant_id=org_id,
-        actor_user_id=admin_user_id,
-        action=f"org.certificate_{decision}",
-        resource_type="org_document",
-        resource_id=document_id,
-        metadata={"note": note},
-    )
-    return await org_repository.list_documents(db, org_id)
+
+
+async def org_modules(db: Prisma, org_id: str) -> dict:
+    return await org_service.get_subscription(db, org_id)
+
+
+async def set_org_tier(db: Prisma, admin_user_id: str, org_id: str, tier: str) -> dict:
+    return await org_service.set_tier_by_platform(db, org_id=org_id, tier=tier, actor_user_id=admin_user_id)
+
+
+async def set_org_module(db: Prisma, admin_user_id: str, org_id: str, module_id: str, enabled: bool) -> dict:
+    return await org_service.set_module(db, org_id, module_id, enabled, actor_user_id=admin_user_id, by_platform=True)
 
 
 async def org_billing(db: Prisma, org_id: str) -> dict:

@@ -7,10 +7,11 @@ from app.core.authz import Scope, ensure_grantable
 from app.core.config import get_settings
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.core.security import hash_refresh_token
+from app.modules.audit.service import write_audit
 from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID
 from app.modules.rbac.service import resolve_permissions
 from app.modules.team import repository
-from app.modules.team.schemas import InviteStaffPayload, UpdateAssignmentPayload
+from app.modules.team.schemas import AddAssignmentPayload, InviteStaffPayload, UpdateAssignmentPayload
 
 
 def _unit_scope_out(row: dict) -> dict:
@@ -82,6 +83,8 @@ async def invite_with_role(
     user = await repository.find_user_by_email(db, email.lower())
     if user is None:
         user = await repository.create_invited_user(db, email=email.lower(), first_name=first_name, last_name=last_name)
+    elif await repository.find_assignment(db, user.id, role_id, unit_scope_id):
+        raise ConflictError("They already have this role over this scope")
 
     # "<tenant>.<secret>" — see identity.service.accept_invite. Only the hash is stored.
     settings = get_settings()
@@ -140,6 +143,57 @@ async def update_assignment(
     return _unit_scope_out(row)
 
 
+async def add_assignment(
+    db: Prisma,
+    tenant_id: str,
+    membership_id: str,
+    scope: Scope,
+    actor_user_id: str,
+    actor_membership_id: str | None,
+    payload: AddAssignmentPayload,
+) -> dict:
+    """Gives someone already on the team a further (role, unit scope) pair.
+
+    It is a separate login-scoped assignment, not a wider one: the person works
+    in one assignment at a time and switches between them, so a branch role
+    never silently widens into the union of everything they hold. The same
+    guards as any other grant apply, and the leader is excluded (their access
+    changes only through a leadership transfer)."""
+    existing = await repository.get_membership_row(db, membership_id)
+    if existing is None or existing["status"] == "invited":
+        raise NotFoundError("No such team member")
+    if str(existing["user_id"]) == actor_user_id or membership_id == actor_membership_id:
+        raise ForbiddenError("You can't change your own access", code="self_assignment")
+    if existing["is_leader"]:
+        raise ForbiddenError("The church leader's access changes only through a leadership transfer")
+    if payload.role_id in (SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID):
+        raise ForbiddenError("Appoint administrators from Church leadership", code="leader_only")
+    # A branch-scoped actor manages only people already inside their branch.
+    if scope.is_scoped and not scope.unit_writable(existing.get("unit_scope")):
+        raise NotFoundError("No such team member")
+
+    unit = await _check_assignable(db, scope, role_id=payload.role_id, unit_scope=payload.unit_scope)
+    duplicate = await repository.find_assignment(db, str(existing["user_id"]), payload.role_id, unit)
+    if duplicate is not None:
+        raise ConflictError(
+            "They already have this role over this scope"
+            + (" (suspended — reactivate it instead)" if duplicate["status"] == "suspended" else "")
+        )
+    created = await repository.create_assignment(
+        db, user_id=str(existing["user_id"]), tenant_id=tenant_id, role_id=payload.role_id, unit_scope_id=unit
+    )
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=actor_user_id,
+        action="team.assignment_added",
+        resource_type="tenant_membership",
+        resource_id=created.id,
+        metadata={"user_id": str(existing["user_id"]), "role_id": payload.role_id, "unit_scope_id": unit},
+    )
+    return _unit_scope_out(await repository.get_membership_row(db, created.id))
+
+
 # ───────────────────────────── Leadership transfer ─────────────────────────────
 
 
@@ -168,7 +222,7 @@ async def request_leadership_transfer(
     eligible = await repository.list_active_membership_ids_excluding(
         db, tenant_id, [leader["id"], nominee_membership_id]
     )
-    return await repository.create_transfer(
+    transfer = await repository.create_transfer(
         db,
         tenant_id=tenant_id,
         outgoing_leader_membership_id=leader["id"],
@@ -176,6 +230,16 @@ async def request_leadership_transfer(
         initiated_by_membership_id=leader["id"],
         eligible_approver_ids=eligible,
     )
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=requester_user_id,
+        action="team.leadership_transfer_requested",
+        resource_type="leadership_transfer",
+        resource_id=transfer["id"],
+        metadata={"nominee_membership_id": nominee_membership_id, "required_approvals": transfer["required_approvals"]},
+    )
+    return transfer
 
 
 async def approve_leadership_transfer(
@@ -203,6 +267,15 @@ async def approve_leadership_transfer(
     await repository.add_approval(
         db, transfer_id, approvals, status="completed" if completed else "pending_approvals", completed=completed
     )
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=approver["user_id"],
+        action="team.leadership_transfer_approved",
+        resource_type="leadership_transfer",
+        resource_id=transfer_id,
+        metadata={"approval_count": len(approvals), "required_approvals": transfer["required_approvals"]},
+    )
     if completed:
         await repository.complete_leader_flip(
             db,
@@ -210,10 +283,22 @@ async def approve_leadership_transfer(
             outgoing_membership_id=transfer["outgoing_leader_membership_id"],
             nominee_membership_id=transfer["nominee_membership_id"],
         )
+        await write_audit(
+            db,
+            tenant_id=tenant_id,
+            actor_user_id=approver["user_id"],
+            action="team.leadership_transfer_completed",
+            resource_type="leadership_transfer",
+            resource_id=transfer_id,
+            metadata={
+                "outgoing_leader_membership_id": transfer["outgoing_leader_membership_id"],
+                "nominee_membership_id": transfer["nominee_membership_id"],
+            },
+        )
     return await repository.get_transfer_by_id(db, transfer_id)
 
 
-async def cancel_leadership_transfer(db: Prisma, transfer_id: str, requester_user_id: str) -> None:
+async def cancel_leadership_transfer(db: Prisma, tenant_id: str, transfer_id: str, requester_user_id: str) -> None:
     transfer = await repository.get_transfer_by_id(db, transfer_id)
     if transfer is None:
         raise NotFoundError("No such leadership transfer")
@@ -222,3 +307,24 @@ async def cancel_leadership_transfer(db: Prisma, transfer_id: str, requester_use
     if leader is None or leader["user_id"] != requester_user_id:
         raise ForbiddenError("Only the current church leader can cancel a leadership transfer")
     await repository.cancel_transfer(db, transfer_id)
+    await write_audit(
+        db,
+        tenant_id=tenant_id,
+        actor_user_id=requester_user_id,
+        action="team.leadership_transfer_canceled",
+        resource_type="leadership_transfer",
+        resource_id=transfer_id,
+    )
+
+
+# ── Used by other modules (leadership) ─────────────────────────────────
+
+
+async def get_membership(db: Prisma, membership_id: str):
+    return await repository.get_membership(db, membership_id)
+
+
+async def set_membership_access(db: Prisma, membership_id: str, *, role_id: str, unit_scope_id: str | None) -> None:
+    """Change what a team member can do. The next request with an old token
+    gets 401 session_stale and refreshes (app.core.deps)."""
+    await repository.update_assignment(db, membership_id, {"role_id": role_id, "unit_scope_id": unit_scope_id})

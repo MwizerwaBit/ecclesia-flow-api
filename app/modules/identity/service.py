@@ -5,7 +5,7 @@ from prisma import Prisma
 from prisma.models import User
 
 from app.core.config import get_settings
-from app.core.database import clear_tenant_context, set_tenant_context, tenant_client
+from app.core.database import clear_tenant_context, independent_transaction, set_tenant_context, set_user_scope
 from app.core.exceptions import AccountLockedError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError
 from app.core.security import (
     TokenError,
@@ -39,15 +39,20 @@ from app.modules.identity.schemas import (
 )
 from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID, SYSTEM_ROLE_NAMES
 from app.modules.rbac.service import resolve_permissions
+from app.modules.tenant import service as tenant_service
 from app.modules.tenant.service import create_organization_with_root_unit
 
 
-async def _set_user_scope(db: Prisma, user_id: str) -> None:
-    await db.execute_raw("select set_config('app.user_id', $1, true)", user_id)
+async def get_active_user(db: Prisma, user_id: str) -> User:
+    """The account behind a valid token, or 401 if it no longer exists."""
+    user = await repository.get_user_by_id(db, user_id)
+    if user is None:
+        raise UnauthorizedError("Account no longer exists")
+    return user
 
 
 async def _membership_summaries(db: Prisma, user_id: str) -> list[MembershipSummary]:
-    await _set_user_scope(db, user_id)
+    await set_user_scope(db, user_id)
     rows = await repository.list_memberships_for_user(db, user_id)
     return [
         MembershipSummary(
@@ -153,9 +158,10 @@ async def register_church_leader(
         timezone_name=payload.timezone,
     )
     settings = get_settings()
-    await db.organization.update(
-        where={"id": org.id},
-        data={
+    await tenant_service.apply_registration_details(
+        db,
+        org.id,
+        {
             "status": "active" if settings.dev_auto_activate_orgs else "pending",
             "denomination": payload.denomination,
             "registration_number": payload.registration_number,
@@ -246,9 +252,7 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
     from app.modules.people import repository as people_repository
     from app.modules.rbac.models import SYSTEM_ROLE_MEMBER_ID
 
-    org = await db.organization.find_unique(where={"slug": payload.church_slug})
-    if org is None or org.status not in ("active", "trial"):
-        raise NotFoundError("No church found at this address")
+    org = await tenant_service.get_live_org_by_slug(db, payload.church_slug)
     if await repository.get_user_by_email(db, payload.email.lower()) is not None:
         raise ForbiddenError("An account with this email already exists — sign in instead")
 
@@ -280,10 +284,11 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
     }
     if match is not None:
         member_id = match["id"]
-        existing = await db.member.find_unique(where={"id": member_id})
-        await db.member.update(
-            where={"id": member_id},
-            data={
+        existing = await people_repository.get_member(db, member_id)
+        await people_repository.update_member(
+            db,
+            member_id,
+            {
                 "user_id": user.id,
                 # Fill gaps only; never overwrite what the church recorded.
                 **({"email": payload.email.lower()} if not existing.email else {}),
@@ -293,10 +298,12 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
         )
         action = "member.self_linked"
     else:
-        member = await db.member.create(
-            data={
-                "tenant_id": org.id,
+        member = await people_repository.create_member(
+            db,
+            org.id,
+            {
                 "user_id": user.id,
+                "title": (payload.title or "").strip() or None,
                 "first_name": payload.first_name.strip(),
                 "last_name": payload.last_name.strip(),
                 "email": payload.email.lower(),
@@ -307,7 +314,7 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
                 "join_method": "first_visit",
                 **protected,
                 **consent,
-            }
+            },
         )
         member_id = member.id
         action = "member.self_registered"
@@ -347,17 +354,40 @@ async def join_church(db: Prisma, payload, *, user_agent: str | None, ip_address
     return session
 
 
-async def _fail_login(user: User | None) -> None:
+async def _fail_login(user: User | None, *, ip_address: str | None = None) -> None:
     """Records a failure in its OWN transaction: the request's transaction
     rolls back when we raise, which would otherwise erase the count and make
-    the lockout unreachable (same reasoning as refresh-reuse revocation)."""
+    the lockout unreachable (same reasoning as refresh-reuse revocation).
+
+    Audited at the account level (``tenant_id=None``, ``actor_user_id=None``):
+    nobody has proven they are this user yet, so the entry names the target
+    account as the resource, not the actor (SA-12)."""
     if user is None:
         return
     settings = get_settings()
-    async with tenant_client.tx() as tx:
-        await repository.record_failed_login(
+    async with independent_transaction() as tx:
+        locked = await repository.record_failed_login(
             tx, user.id, max_failures=settings.max_failed_logins, lockout_minutes=settings.lockout_minutes
         )
+        await write_audit(
+            tx,
+            tenant_id=None,
+            actor_user_id=None,
+            action="auth.login_failed",
+            resource_type="user",
+            resource_id=user.id,
+            ip_address=ip_address,
+        )
+        if locked:
+            await write_audit(
+                tx,
+                tenant_id=None,
+                actor_user_id=None,
+                action="auth.account_locked",
+                resource_type="user",
+                resource_id=user.id,
+                ip_address=ip_address,
+            )
 
 
 def _locked(user: User) -> bool:
@@ -382,7 +412,7 @@ async def authenticate(
     # Constant-shape failure: a wrong password and a nonexistent email return
     # the identical error, so the endpoint can't be used to enumerate accounts.
     if not password_ok:
-        await _fail_login(user)
+        await _fail_login(user, ip_address=ip_address)
         raise UnauthorizedError("Incorrect email or password")
     if user.status != "active":
         raise ForbiddenError("This account is not active")
@@ -423,12 +453,33 @@ async def complete_mfa_challenge(
     if _locked(user):
         raise AccountLockedError("Too many failed sign-in attempts. Try again later.", locked_until=user.locked_until)
 
+    # Single-use, capped-attempt (SA-10): claimed before the code is even
+    # checked, so a replayed or exhausted token is rejected regardless of
+    # whether the attacker happens to guess right. In its OWN transaction —
+    # same reasoning as _fail_login: this call is usually followed by a
+    # raise, which would otherwise roll the claim back and make the token
+    # replayable forever.
+    settings = get_settings()
+    async with independent_transaction() as tx:
+        attempt = await repository.claim_mfa_attempt(
+            tx, jti=payload["jti"], user_id=user.id, expires_at=datetime.fromtimestamp(payload["exp"], tz=UTC)
+        )
+        if attempt is not None and attempt > settings.mfa_challenge_max_attempts:
+            await repository.burn_mfa_attempt(tx, payload["jti"])
+    if attempt is None:
+        raise UnauthorizedError(
+            "This verification attempt is no longer valid — sign in again", code="mfa_challenge_invalid"
+        )
+    if attempt > settings.mfa_challenge_max_attempts:
+        raise UnauthorizedError("Too many attempts — sign in again for a new code", code="mfa_challenge_invalid")
+
     if not await _verify_code_or_backup(db, user, code):
         # Wrong second-factor codes count toward the same lockout, so a stolen
         # password can't be paired with unlimited TOTP guesses.
-        await _fail_login(user)
+        await _fail_login(user, ip_address=ip_address)
         raise UnauthorizedError("Incorrect verification code")
 
+    await repository.burn_mfa_attempt(db, payload["jti"])
     await repository.clear_failed_logins(db, user.id)
     memberships = await _membership_summaries(db, user.id)
     primary = next((m for m in memberships if m.is_primary), memberships[0] if memberships else None)
@@ -471,7 +522,7 @@ async def switch_tenant(
     user_agent: str | None,
     ip_address: str | None,
 ) -> SessionResponse:
-    await _set_user_scope(db, user_id)
+    await set_user_scope(db, user_id)
     membership = await repository.get_membership(db, membership_id)
     if membership is None or membership.user_id != user_id or membership.status != "active":
         raise NotFoundError("No such membership for this account")
@@ -490,6 +541,41 @@ async def switch_tenant(
     return session
 
 
+async def switch_assignment(
+    db: Prisma,
+    *,
+    user_id: str,
+    current_tenant_id: str | None,
+    membership_id: str,
+    mfa_verified: bool,
+    user_agent: str | None,
+    ip_address: str | None,
+) -> SessionResponse:
+    """Move to another of the caller's own assignments in the SAME church.
+
+    A login can hold several (role, unit scope) pairs in one church; a session
+    works under exactly one at a time. This is deliberately not switch_tenant:
+    it can't hop churches, so a stolen session can't be pointed elsewhere."""
+    await set_user_scope(db, user_id)
+    membership = await repository.get_membership(db, membership_id)
+    if (
+        membership is None
+        or membership.user_id != user_id
+        or membership.status != "active"
+        or current_tenant_id is None
+        or str(membership.tenant_id) != str(current_tenant_id)
+    ):
+        raise NotFoundError("No such assignment for this account in this church")
+    return await switch_tenant(
+        db,
+        user_id=user_id,
+        membership_id=membership_id,
+        mfa_verified=mfa_verified,
+        user_agent=user_agent,
+        ip_address=ip_address,
+    )
+
+
 async def refresh_session(
     db: Prisma, *, raw_refresh_token: str, user_agent: str | None, ip_address: str | None
 ) -> SessionResponse:
@@ -506,7 +592,7 @@ async def refresh_session(
         # docs/SECURITY_NOTES.md §2 — Prisma has no mid-transaction manual
         # commit, so "commit before raising" has to mean a separate
         # transaction, not a call on this one).
-        async with tenant_client.tx() as revoke_tx:
+        async with independent_transaction() as revoke_tx:
             await repository.revoke_refresh_token_family(revoke_tx, row.family_id)
         raise UnauthorizedError("Refresh token reuse detected — all sessions for this device chain were revoked")
     if row.expires_at < datetime.now(UTC):
@@ -523,6 +609,14 @@ async def refresh_session(
     target = None
     if row.membership_id:
         target = next((m for m in memberships if str(m.id) == row.membership_id), None)
+    if target is None and row.membership_id:
+        # The assignment this session worked under is gone (suspended, say). Stay in the
+        # same church on another of the person's assignments rather than jumping to
+        # whichever church they joined first.
+        old = await repository.get_membership(db, row.membership_id)
+        if old is not None:
+            same_church = [m for m in memberships if str(m.tenant_id) == str(old.tenant_id)]
+            target = next((m for m in same_church if m.is_primary), same_church[0] if same_church else None)
     if target is None:
         target = next((m for m in memberships if m.is_primary), memberships[0] if memberships else None)
 
@@ -585,7 +679,7 @@ async def accept_invite(
         raise UnauthorizedError("This invitation link is not valid")
     if user.password_hash:
         if not verify_password(password, user.password_hash):
-            await _fail_login(user)
+            await _fail_login(user, ip_address=ip_address)
             raise UnauthorizedError("Incorrect password for your existing account")
     else:
         await repository.set_password(

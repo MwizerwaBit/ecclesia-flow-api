@@ -98,3 +98,19 @@ async def create_document(db: Prisma, data: dict) -> OrgDocument:
 
 async def get_subscription(db: Prisma, tenant_id: str):
     return await db.billingsubscription.find_unique(where={"tenant_id": tenant_id})
+
+
+async def update_document(db: Prisma, document_id: str, data: dict) -> None:
+    await db.orgdocument.update(where={"id": document_id}, data=data)
+
+
+async def get_org_by_slug(db: Prisma, slug: str) -> Organization | None:
+    return await db.organization.find_unique(where={"slug": slug})
+
+
+async def get_configuration(db: Prisma, tenant_id: str):
+    return await db.organizationconfiguration.find_unique(where={"tenant_id": tenant_id})
+
+
+async def upsert_configuration(db: Prisma, tenant_id: str, *, create: dict, update: dict) -> None:
+    await db.organizationconfiguration.upsert(where={"tenant_id": tenant_id}, data={"create": create, "update": update})

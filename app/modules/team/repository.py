@@ -90,6 +90,39 @@ async def create_membership(
     )
 
 
+async def create_assignment(db: Prisma, *, user_id: str, tenant_id: str, role_id: str, unit_scope_id: str | None):
+    """An already-accepted person's further assignment: active at once, never
+    primary and never the leader."""
+    now = datetime.now(UTC)
+    return await db.tenantmembership.create(
+        data={
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "role_id": role_id,
+            "unit_scope_id": unit_scope_id,
+            "status": "active",
+            "invited_at": now,
+            "accepted_at": now,
+        }
+    )
+
+
+async def find_assignment(db: Prisma, user_id: str, role_id: str, unit_scope_id: str | None) -> dict | None:
+    """The row, if this login already holds this exact role over this exact scope
+    (NULL scope = the whole church) in the current church."""
+    rows = await db.query_raw(
+        """
+        select id, status from tenant_memberships
+        where user_id = $1::uuid and tenant_id = current_tenant_id() and role_id = $2::uuid
+          and unit_scope_id is not distinct from $3::uuid
+        """,
+        user_id,
+        role_id,
+        unit_scope_id,
+    )
+    return rows[0] if rows else None
+
+
 async def role_exists(db: Prisma, role_id: str) -> bool:
     # System roles (tenant_id null) and this church's custom roles; RLS hides others.
     return await db.role.find_unique(where={"id": role_id}) is not None
@@ -194,3 +227,7 @@ async def complete_leader_flip(
         where={"tenant_id": tenant_id, "id": nominee_membership_id},
         data={"is_leader": True, "role_id": SYSTEM_ROLE_LEADER_ID, "unit_scope_id": None},
     )
+
+
+async def get_membership(db: Prisma, membership_id: str):
+    return await db.tenantmembership.find_unique(where={"id": membership_id})

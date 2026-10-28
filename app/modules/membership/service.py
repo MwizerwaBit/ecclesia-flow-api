@@ -12,8 +12,10 @@ from prisma import Prisma
 
 from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.modules.audit.service import write_audit
+from app.modules.hierarchy import service as hierarchy_service
 from app.modules.membership import repository
 from app.modules.membership.schemas import AssociateMembershipCreate, MoveHomeUnitRequest
+from app.modules.people import service as people_service
 
 # Allowed lifecycle moves, by current status.
 _TRANSITIONS = {
@@ -29,7 +31,7 @@ async def list_for_member(db: Prisma, member_id: str) -> list[dict]:
 
 
 async def _unit_exists(db: Prisma, unit_id: str) -> None:
-    if await db.hierarchyunit.find_unique(where={"id": unit_id}) is None:
+    if not await hierarchy_service.unit_exists(db, unit_id):
         raise NotFoundError("No such unit")
 
 
@@ -37,7 +39,7 @@ async def add_associate(
     db: Prisma, *, tenant_id: str, user_id: str, member_id: str, payload: AssociateMembershipCreate
 ) -> dict:
     await _unit_exists(db, payload.unit_id)
-    member = await db.member.find_unique(where={"id": member_id})
+    member = await people_service.get_member_record(db, member_id)
     if member is None:
         raise NotFoundError("No such member")
     if member.unit_id == payload.unit_id:
@@ -72,7 +74,7 @@ async def move_home(
     transferred (with the reason), a new one starts today, and an associate
     membership in the new unit, if any, is closed because it becomes home."""
     await _unit_exists(db, payload.unit_id)
-    member = await db.member.find_unique(where={"id": member_id})
+    member = await people_service.get_member_record(db, member_id)
     if member is None:
         raise NotFoundError("No such member")
     if member.unit_id == payload.unit_id:

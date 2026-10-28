@@ -6,6 +6,7 @@ from app.core.exceptions import ForbiddenError
 from app.core.pagination import PaginatedRoute
 from app.modules.team import service
 from app.modules.team.schemas import (
+    AddAssignmentPayload,
     InviteStaffPayload,
     LeadershipTransferRead,
     RequestLeadershipTransferPayload,
@@ -29,6 +30,20 @@ async def get_leader(db: TenantDb):
 @router.post("/invite", response_model=TeamMemberRead, dependencies=[Depends(require_permission("team:invite"))])
 async def invite(payload: InviteStaffPayload, claims: CurrentClaims, scope: CurrentScope, db: TenantDb):
     return await service.invite(db, claims.tenant_id, scope, payload)
+
+
+@router.post(
+    "/{membership_id}/assignments",
+    response_model=TeamMemberRead,
+    status_code=201,
+    dependencies=[Depends(require_permission("team:invite"))],
+)
+async def add_assignment(
+    membership_id: str, payload: AddAssignmentPayload, claims: CurrentClaims, scope: CurrentScope, db: TenantDb
+):
+    return await service.add_assignment(
+        db, claims.tenant_id, membership_id, scope, claims.sub, claims.membership_id, payload
+    )
 
 
 @router.patch(
@@ -71,4 +86,4 @@ async def approve_leadership_transfer(transfer_id: str, claims: CurrentClaims, d
 
 @router.delete("/leadership-transfer/{transfer_id}", status_code=204, dependencies=[Depends(require_step_up)])
 async def cancel_leadership_transfer(transfer_id: str, claims: CurrentClaims, db: TenantDb):
-    await service.cancel_leadership_transfer(db, transfer_id, claims.sub)
+    await service.cancel_leadership_transfer(db, claims.tenant_id, transfer_id, claims.sub)

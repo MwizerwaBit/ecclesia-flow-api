@@ -8,7 +8,7 @@ from app.core.exceptions import ForbiddenError, UnauthorizedError
 from app.core.mailer import send_quietly
 from app.core.pagination import PaginatedRoute
 from app.core.rate_limit import limiter
-from app.modules.identity import recovery, repository, service
+from app.modules.identity import recovery, service
 from app.modules.identity.schemas import (
     AcceptInviteRequest,
     JoinChurchRequest,
@@ -36,10 +36,7 @@ def _client_ip(request: Request) -> str | None:
 
 
 async def _current_user(claims: CurrentClaims, db: PreTenantDb):
-    user = await repository.get_user_by_id(db, claims.sub)
-    if user is None:
-        raise UnauthorizedError("Account no longer exists")
-    return user
+    return await service.get_active_user(db, claims.sub)
 
 
 CurrentUser = Annotated[object, Depends(_current_user)]
@@ -166,6 +163,22 @@ async def switch_tenant(
     session = await service.switch_tenant(
         db,
         user_id=claims.sub,
+        membership_id=str(payload.membership_id),
+        mfa_verified=claims.mfa_verified,
+        user_agent=request.headers.get("user-agent"),
+        ip_address=_client_ip(request),
+    )
+    return _deliver(request, response, session)
+
+
+@router.post("/switch-assignment", response_model=SessionResponse)
+async def switch_assignment(
+    request: Request, response: Response, payload: SwitchTenantRequest, claims: CurrentClaims, db: PreTenantDb
+):
+    session = await service.switch_assignment(
+        db,
+        user_id=claims.sub,
+        current_tenant_id=claims.tenant_id,
         membership_id=str(payload.membership_id),
         mfa_verified=claims.mfa_verified,
         user_agent=request.headers.get("user-agent"),

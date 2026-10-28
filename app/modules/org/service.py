@@ -1,10 +1,13 @@
 """The church's own view of itself: profile, plan modules, official documents
 and the onboarding checklist that leads from registration to activation."""
 
+from datetime import UTC, datetime, timedelta
+
 from prisma import Prisma
 
 from app.core import private_storage
 from app.core.authz import Scope
+from app.core.entitlement import load_access
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.modules.audit.service import write_audit
 from app.modules.org import repository
@@ -23,6 +26,16 @@ async def _org_or_404(db: Prisma, org_id: str):
 
 
 # ───────────────────────────── Profile ─────────────────────────────
+
+
+async def find_org(db: Prisma, org_id: str):
+    """The organisation or None — for callers (e.g. webhooks) where a missing
+    church is not an error."""
+    return await repository.get_org(db, org_id)
+
+
+async def find_org_by_slug(db: Prisma, slug: str):
+    return await repository.get_org_by_slug(db, slug)
 
 
 async def get_profile(db: Prisma, org_id: str):
@@ -55,8 +68,11 @@ async def update_profile(db: Prisma, org_id: str, actor_user_id: str, payload: O
 async def get_subscription(db: Prisma, org_id: str) -> dict:
     org = await _org_or_404(db, org_id)
     overrides = await repository.list_module_overrides(db, org_id)
+    # A church that isn't paid up is shown as free-tier, so the paid modules
+    # lock in the app exactly as the API locks them (billing/entitlement.py).
+    access = await load_access(db, org_id)
     return {
-        "tier": org.tier,
+        "tier": access.tier if access is not None else org.tier,
         "overrides": {o.module_id: o.enabled for o in overrides},
         "platform_managed": sorted(o.module_id for o in overrides if o.set_by_platform),
     }
@@ -149,6 +165,72 @@ async def read_document(db: Prisma, org_id: str, document_id: str) -> tuple[byte
     if doc is None:
         raise NotFoundError("No such document")
     return private_storage.read(doc.storage_key, doc.sha256), doc.mime_type, doc.file_name
+
+
+async def review_document(
+    db: Prisma, *, admin_user_id: str, org_id: str, document_id: str, decision: str, note: str | None
+) -> list[dict]:
+    """A platform admin verifies or rejects an official document; the
+    organisation's verification status follows the decision."""
+    doc = await repository.get_document(db, org_id, document_id)
+    if doc is None:
+        raise NotFoundError("No such document")
+    if doc.status != "pending_review":
+        raise ConflictError("This document has already been reviewed or replaced")
+    await repository.update_document(
+        db,
+        document_id,
+        {
+            "status": decision,
+            "reviewed_by_user_id": admin_user_id,
+            "reviewed_at": datetime.now(UTC),
+            "review_note": note,
+        },
+    )
+    await repository.update_org(db, org_id, {"verification_status": decision})
+    await write_audit(
+        db,
+        tenant_id=org_id,
+        actor_user_id=admin_user_id,
+        action=f"org.certificate_{decision}",
+        resource_type="org_document",
+        resource_id=document_id,
+        metadata={"note": note},
+    )
+    return await repository.list_documents(db, org_id)
+
+
+async def set_tier_by_platform(db: Prisma, *, org_id: str, tier: str, actor_user_id: str) -> dict:
+    await _org_or_404(db, org_id)
+    await repository.update_org(db, org_id, {"tier": tier})
+    await write_audit(
+        db,
+        tenant_id=org_id,
+        actor_user_id=actor_user_id,
+        action="org.tier_set_by_platform",
+        resource_type="organization",
+        resource_id=org_id,
+        metadata={"tier": tier},
+    )
+    return await get_subscription(db, org_id)
+
+
+async def mark_registered_by_platform(db: Prisma, *, org_id: str, tier: str, trial_days: int) -> None:
+    """A church registered by EcclesiaFlow staff is active from the start, on
+    the chosen plan, with the reason recorded."""
+    now = datetime.now(UTC)
+    await repository.update_org(
+        db,
+        org_id,
+        {
+            "status": "active",
+            "tier": tier,
+            "activated_at": now,
+            "activation_source": "platform_admin",
+            "activation_note": "Registered by EcclesiaFlow",
+            "trial_ends_at": now + timedelta(days=trial_days),
+        },
+    )
 
 
 # ───────────────────────────── People in charge ─────────────────────────────

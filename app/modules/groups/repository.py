@@ -133,3 +133,75 @@ async def update_membership(db: Prisma, membership_id: str, data: dict) -> Group
 
 async def delete_membership(db: Prisma, membership_id: str) -> None:
     await db.groupmembership.delete(where={"id": membership_id})
+
+
+async def create_role(db: Prisma, data: dict):
+    return await db.grouprole.create(data=data)
+
+
+async def update_role(db: Prisma, role_id: str, data: dict):
+    return await db.grouprole.update(where={"id": role_id}, data=data)
+
+
+async def delete_role(db: Prisma, role_id: str) -> None:
+    await db.grouprole.delete(where={"id": role_id})
+
+
+# ── Member-facing queries (used through groups.service by the portal) ──
+
+
+async def groups_of_member(db: Prisma, member_id: str) -> list[dict]:
+    return await db.query_raw(
+        """
+        select gm.id as membership_id, gm.status, gm.role, gr.name as role_name, gr.capabilities, gr.rank,
+               gm.invited_at, gm.responded_at,
+               g.id as group_id, g.name, g.type, g.description, g.color, g.meeting_frequency, g.meeting_day,
+               g.meeting_time, g.meeting_location,
+               (select count(*) from group_memberships x where x.group_id = g.id and x.status = 'active')::int
+                 as member_count
+        from group_memberships gm
+        join groups g on g.id = gm.group_id and not g.is_archived
+        join group_roles gr on gr.tenant_id = gm.tenant_id and gr.key = gm.role
+        where gm.member_id = $1::uuid and gm.status in ('invited', 'active')
+        order by gm.status desc, g.name, g.id
+        """,
+        member_id,
+    )
+
+
+async def get_membership(db: Prisma, membership_id: str) -> GroupMembership | None:
+    return await db.groupmembership.find_unique(where={"id": membership_id})
+
+
+async def find_active_membership(db: Prisma, group_id: str, member_id: str) -> GroupMembership | None:
+    return await db.groupmembership.find_first(where={"group_id": group_id, "member_id": member_id, "status": "active"})
+
+
+async def get_group_record(db: Prisma, group_id: str) -> Group | None:
+    return await db.group.find_unique(where={"id": group_id})
+
+
+async def list_memberships(db: Prisma, group_id: str) -> list[GroupMembership]:
+    return await db.groupmembership.find_many(where={"group_id": group_id})
+
+
+async def count_active_with_role(db: Prisma, group_id: str, role_key: str) -> int:
+    return await db.groupmembership.count(where={"group_id": group_id, "role": role_key, "status": "active"})
+
+
+async def invite_candidates(db: Prisma, group_id: str, term: str) -> list[dict]:
+    """Names only — enough to pick someone, never a directory dump."""
+    return await db.query_raw(
+        """
+        select m.id, m.first_name, m.last_name, m.photo_url
+        from members m
+        where m.status in ('active', 'visitor', 'prospect')
+          and lower(m.first_name || ' ' || m.last_name) like $2
+          and not exists (select 1 from group_memberships gm where gm.group_id = $1::uuid and gm.member_id = m.id
+                          and gm.status in ('invited', 'active'))
+        order by m.last_name, m.first_name
+        limit 20
+        """,
+        group_id,
+        f"%{term}%",
+    )

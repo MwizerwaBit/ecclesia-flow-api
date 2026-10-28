@@ -49,6 +49,8 @@ class MemberGroupRef(BaseModel):
 
 class MemberListItem(BaseModel):
     id: str
+    #: Mr, Dr, Rev, Fr, Prophet… shown before the name.
+    title: str | None = None
     first_name: str
     last_name: str
     preferred_name: str | None
@@ -269,6 +271,14 @@ class VisitorFollowUp(BaseModel):
     assigned_to_name: str | None
     status: str
     notes: str | None
+
+
+class AssignFollowUpInput(BaseModel):
+    assigned_to_user_id: str
+
+
+class ResolveFollowUpInput(BaseModel):
+    note: Annotated[str, StringConstraints(max_length=2000)] | None = None
 
 
 class PastoralNoteRead(BaseModel):

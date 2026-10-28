@@ -9,6 +9,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -65,4 +66,29 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith(get_settings().media_public_url_prefix + "/"):
             # Uploaded files: never executable, never framed, even if one slips past the type check.
             response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; sandbox"
+        return response
+
+
+class AuditTapMiddleware(BaseHTTPMiddleware):
+    """Calls back on every authorization failure (SA-12), without app.core
+    depending on the audit module (ADR-0009 — core may not import a module).
+    This layer only decides *when*; app.main supplies *what to write*.
+
+    A plain middleware, not an AppError exception handler, because by the
+    time a custom ``@app.middleware``/``BaseHTTPMiddleware`` sees the
+    response, FastAPI's own exception handling has already turned the raised
+    ForbiddenError into a response — there is no exception left to catch
+    here, only its status code. ``request.state.claims``, set deep inside
+    route dependency resolution (``get_current_claims``), is still readable
+    afterward because ``request.state`` is the same object throughout the
+    ASGI stack regardless of middleware ordering."""
+
+    def __init__(self, app, on_forbidden: Callable[[Request], Awaitable[None]]):
+        super().__init__(app)
+        self._on_forbidden = on_forbidden
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        if response.status_code == 403:
+            await self._on_forbidden(request)
         return response
