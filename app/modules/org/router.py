@@ -17,6 +17,8 @@ from app.modules.org.schemas import (
     OrgDocumentRead,
     OrgProfile,
     OrgProfileUpdate,
+    SecuritySettings,
+    SecuritySettingsUpdate,
     SetModuleInput,
     SetTierInput,
 )
@@ -56,6 +58,17 @@ async def get_terminology(claims: CurrentClaims, db: TenantDb):
 @router.put("/terminology", response_model=TerminologyRead, dependencies=[Depends(require_permission("org:settings"))])
 async def update_terminology(payload: TerminologyUpdate, claims: CurrentClaims, db: TenantDb):
     return await terminology.update_terminology(db, claims.tenant_id, claims.sub, payload)
+
+
+@router.get("/security", response_model=SecuritySettings, dependencies=ANY_MEMBER)
+async def get_security(claims: CurrentClaims, db: TenantDb):
+    return await service.get_security(db, claims.tenant_id)
+
+
+@router.put("/security", response_model=SecuritySettings, dependencies=[Depends(require_permission("org:settings"))])
+async def set_security(payload: SecuritySettingsUpdate, claims: CurrentClaims, db: TenantDb):
+    """How long a leader-side session may sit idle. Members always get an hour."""
+    return await service.set_security(db, claims.tenant_id, payload.session_idle_minutes, actor_user_id=claims.sub)
 
 
 @router.get("/modules", response_model=ModuleSubscription, dependencies=ANY_MEMBER)

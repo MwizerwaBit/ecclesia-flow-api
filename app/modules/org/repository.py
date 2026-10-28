@@ -114,3 +114,12 @@ async def get_configuration(db: Prisma, tenant_id: str):
 
 async def upsert_configuration(db: Prisma, tenant_id: str, *, create: dict, update: dict) -> None:
     await db.organizationconfiguration.upsert(where={"tenant_id": tenant_id}, data={"create": create, "update": update})
+
+
+async def get_session_idle_minutes(db: Prisma, org_id: str) -> int:
+    rows = await db.query_raw("select session_idle_minutes from organizations where id = $1::uuid", org_id)
+    return rows[0]["session_idle_minutes"]
+
+
+async def set_session_idle_minutes(db: Prisma, org_id: str, minutes: int) -> None:
+    await db.execute_raw("update organizations set session_idle_minutes = $2 where id = $1::uuid", org_id, minutes)

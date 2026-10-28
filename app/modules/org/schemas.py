@@ -106,3 +106,15 @@ class InvitePersonInput(BaseModel):
     email: EmailStr
     first_name: Text100
     last_name: Text100 = Field(default="")
+
+
+class SecuritySettings(BaseModel):
+    #: Minutes a leader-side session may sit idle before sign-out (members: always 60).
+    session_idle_minutes: int
+    min_minutes: int
+    max_minutes: int
+    member_minutes: int
+
+
+class SecuritySettingsUpdate(BaseModel):
+    session_idle_minutes: int = Field(ge=5, le=120)
