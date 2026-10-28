@@ -86,6 +86,24 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     stripe_publishable_key: str = ""
     billing_currency: str = "usd"
+    # How churches pay when no Stripe keys are set: "manual" (mobile money, a
+    # platform admin approves each payment) or "demo" (test-card page, for
+    # demos and tests). Stripe keys, once filled in, take over automatically.
+    payment_method: str = "manual"
+
+    # ── Manual (mobile-money) payments ───────────────────────────────────
+    momo_number: str = ""
+    momo_account_name: str = ""
+    momo_network: str = "MTN MoMo"
+    # Optional: told by email when a payment is waiting for approval.
+    payment_alert_email: str = ""
+    # After a plan ends (or a new church's first days), free basics keep
+    # working this long; then the church is view-only until it pays.
+    billing_grace_days: int = 3
+    # "Your plan ends soon" email goes out this many days before the end.
+    renewal_reminder_days: int = 7
+    # The in-process job that sends those emails. Off in tests.
+    run_background_jobs: bool = True
     # Signs demo webhooks exactly like Stripe signs real ones, so the demo
     # exercises the same verification and processing path.
     demo_webhook_secret: str = "whsec_demo_only_not_secret"
@@ -119,7 +137,9 @@ class Settings(BaseSettings):
 
     @property
     def billing_provider(self) -> str:
-        return "stripe" if self.stripe_secret_key else "demo"
+        if self.stripe_secret_key:
+            return "stripe"
+        return "demo" if self.payment_method == "demo" else "manual"
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -140,7 +160,12 @@ class Settings(BaseSettings):
             "APP_PLATFORM_DB_PASSWORD": self.app_platform_db_password.startswith("change_me"),
             "DATABASE_URL_APP (default password)": "change_me" in self.database_url_app,
             "DATABASE_URL_PLATFORM (default password)": "change_me" in self.database_url_platform,
-            "STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET": not (self.stripe_secret_key and self.stripe_webhook_secret),
+            "STRIPE_WEBHOOK_SECRET (needed with STRIPE_SECRET_KEY)": bool(self.stripe_secret_key)
+            and not self.stripe_webhook_secret,
+            "PAYMENT_METHOD=demo (test cards) must not run in production": self.payment_method == "demo"
+            and not self.stripe_secret_key,
+            "MOMO_NUMBER / MOMO_ACCOUNT_NAME (where churches send payment)": self.billing_provider == "manual"
+            and not (self.momo_number and self.momo_account_name),
             "SMTP_HOST": not self.smtp_host,
             "DEV_AUTO_ACTIVATE_ORGS (must be unset)": self.dev_auto_activate_orgs,
             # memory:// is per-process: with more than one worker, each one

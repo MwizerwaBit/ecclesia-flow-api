@@ -1,19 +1,24 @@
 """Billing endpoints. Not behind the active-organisation gate: paying is how a
 pending church becomes active."""
 
-from fastapi import APIRouter, Depends, Request
+from typing import Annotated
 
-from app.core.deps import CurrentClaims, TenantDb, require_permission
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+
+from app.core.deps import CurrentAccess, CurrentClaims, TenantDb, require_permission
 from app.core.pagination import PaginatedRoute
 from app.core.rate_limit import limiter
-from app.modules.billing import service
+from app.modules.billing import manual, service
 from app.modules.billing.schemas import (
+    AccessRead,
     BillingOverview,
     CheckoutInput,
     CheckoutRead,
     DemoCheckoutRead,
     DemoPayInput,
     DemoPayResult,
+    ManualPaymentRead,
+    PaymentInstructions,
     PlanRead,
 )
 
@@ -27,6 +32,14 @@ async def list_plans():
     return service.list_plans()
 
 
+@router.get("/access", response_model=AccessRead | None)
+async def my_access(access: CurrentAccess, db: TenantDb):
+    """What this church may do right now. Open to every signed-in member of the
+    church (not just billing managers), because the whole app greys itself out
+    by it. Null for a platform admin, who has no church."""
+    return await service.access_for(db, access)
+
+
 @router.get("/overview", response_model=BillingOverview, dependencies=MANAGE)
 async def overview(claims: CurrentClaims, db: TenantDb):
     return await service.overview(db, claims.tenant_id)
@@ -36,6 +49,43 @@ async def overview(claims: CurrentClaims, db: TenantDb):
 @limiter.limit("10/minute")
 async def create_checkout(request: Request, payload: CheckoutInput, claims: CurrentClaims, db: TenantDb):
     return await service.create_checkout(db, claims.tenant_id, claims.sub, payload)
+
+
+@router.get("/manual/instructions", response_model=PaymentInstructions, dependencies=MANAGE)
+async def manual_instructions(tier: str, months: Annotated[int, Query(ge=1, le=manual.MAX_MONTHS)]):
+    """Where to send the money, and how much, for the plan and months chosen."""
+    return manual.instructions(tier, months)
+
+
+@router.get("/manual/payments", response_model=list[ManualPaymentRead], dependencies=MANAGE)
+async def my_manual_payments(db: TenantDb):
+    return await manual.list_for_church(db)
+
+
+@router.post("/manual/payments", response_model=ManualPaymentRead, status_code=201, dependencies=MANAGE)
+@limiter.limit("6/hour")
+async def submit_manual_payment(
+    request: Request,
+    claims: CurrentClaims,
+    db: TenantDb,
+    tier: Annotated[str, Form()],
+    months: Annotated[int, Form(ge=1, le=manual.MAX_MONTHS)],
+    sender_name: Annotated[str, Form()],
+    sent_amount_cents: Annotated[int, Form(gt=0)],
+    proof: Annotated[UploadFile, File()],
+    momo_transaction_id: Annotated[str | None, Form()] = None,
+):
+    return await manual.submit(
+        db,
+        org_id=claims.tenant_id,
+        user_id=claims.sub,
+        tier=tier,
+        months=months,
+        sender_name=sender_name,
+        sent_amount_cents=sent_amount_cents,
+        momo_transaction_id=momo_transaction_id,
+        proof=await proof.read(),
+    )
 
 
 @router.get("/demo/checkout/{session_id}", response_model=DemoCheckoutRead, dependencies=MANAGE)

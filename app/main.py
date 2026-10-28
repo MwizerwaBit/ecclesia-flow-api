@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,14 +17,18 @@ from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import AuditTapMiddleware, RequestIdMiddleware, SecurityHeadersMiddleware
 from app.core.rate_limit import limiter
+from app.modules.billing.reminders import run_forever
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     await connect_clients()
+    reminders = asyncio.create_task(run_forever()) if get_settings().run_background_jobs else None
     try:
         yield
     finally:
+        if reminders:
+            reminders.cancel()
         await disconnect_clients()
 
 

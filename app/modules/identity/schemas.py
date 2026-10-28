@@ -66,6 +66,8 @@ class JoinChurchRequest(BaseModel):
     """A person registering themselves into a church they attend."""
 
     church_slug: str = Field(min_length=2, max_length=120)
+    #: Optional form of address: Mr, Dr, Rev, Fr, Prophet, Ev…
+    title: str | None = Field(default=None, max_length=30)
     first_name: str = Field(min_length=1, max_length=100)
     last_name: str = Field(min_length=1, max_length=100)
     email: EmailStr

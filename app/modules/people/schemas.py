@@ -49,6 +49,8 @@ class MemberGroupRef(BaseModel):
 
 class MemberListItem(BaseModel):
     id: str
+    #: Mr, Dr, Rev, Fr, Prophet… shown before the name.
+    title: str | None = None
     first_name: str
     last_name: str
     preferred_name: str | None

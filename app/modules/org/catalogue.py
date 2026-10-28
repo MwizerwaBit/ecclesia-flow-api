@@ -55,6 +55,14 @@ class Plan:
     def price(self, interval: str) -> int | None:
         return self.monthly_cents if interval == "month" else self.yearly_cents
 
+    def price_for_months(self, months: int) -> int | None:
+        """What `months` months cost: whole years at the yearly price, the rest
+        at the monthly rate (but never more than a year would cost)."""
+        if self.monthly_cents is None or self.yearly_cents is None:
+            return None
+        years, rest = divmod(months, 12)
+        return years * self.yearly_cents + min(rest * self.monthly_cents, self.yearly_cents if rest else 0)
+
 
 PLANS: list[Plan] = [
     Plan("seed", "Seed", 1900, "For a single congregation getting organised", 250),

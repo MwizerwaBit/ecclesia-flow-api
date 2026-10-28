@@ -6,7 +6,7 @@ from prisma.models import Member, PastoralNote, SacramentalRecord
 from app.core.prisma_utils import coerce_dates
 
 _LIST_ITEM_SQL = """
-    select m.id, m.first_name, m.last_name, m.preferred_name, m.photo_url,
+    select m.id, m.title, m.first_name, m.last_name, m.preferred_name, m.photo_url,
            upper(left(m.first_name,1) || left(m.last_name,1)) as initials,
            m.status, m.unit_id, hu.name as unit_name, m.envelope_number, m.last_seen_at,
            m.email, m.phone, m.whatsapp, m.gender, m.joined_at, m.household_id,
