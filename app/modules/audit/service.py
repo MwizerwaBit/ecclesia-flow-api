@@ -32,3 +32,9 @@ async def write_audit(
         is_impersonated=is_impersonated,
         impersonated_by_user_id=impersonated_by_user_id,
     )
+
+
+async def history_for(db: Prisma, resource_type: str, resource_id: str, limit: int = 100) -> list[dict]:
+    """Audit entries for one record. Callers decide who may ask (a route's
+    permission and scope checks); this only reads."""
+    return await repository.list_for_resource(db, resource_type, resource_id, limit)
