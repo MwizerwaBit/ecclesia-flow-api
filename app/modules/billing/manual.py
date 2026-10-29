@@ -47,9 +47,31 @@ def price_for(tier: str, months: int) -> tuple[str, int]:
     return plan.name, amount
 
 
-def instructions(tier: str, months: int) -> dict:
+def price_options(base_amount: int) -> dict[str, int]:
+    """What the price is in each currency a church may pay in, in cents.
+
+    The catalogue is in `billing_currency`. The other of USD / RWF is offered
+    only when the operator set `rwf_per_usd`, and is rounded up to a whole
+    franc (or a whole cent) so a church is never asked for less than the price."""
     settings = get_settings()
-    plan_name, amount = price_for(tier, months)
+    base = settings.billing_currency.lower()
+    options = {base: base_amount}
+    rate = settings.rwf_per_usd
+    if rate > 0 and base == "usd":
+        options["rwf"] = -(-base_amount * rate // 100) * 100  # ceil(usd_cents/100*rate) francs
+    elif rate > 0 and base == "rwf":
+        options["usd"] = -(-base_amount // rate)  # ceil(francs/rate*100) cents
+    return options
+
+
+def instructions(tier: str, months: int, currency: str | None = None) -> dict:
+    settings = get_settings()
+    plan_name, base_amount = price_for(tier, months)
+    options = price_options(base_amount)
+    currency = (currency or settings.billing_currency).lower()
+    if currency not in options:
+        raise BadPaymentError(f"Payment in {currency.upper()} isn't available")
+    amount = options[currency]
     return {
         "network": settings.momo_network,
         "number": settings.momo_number,
@@ -58,7 +80,8 @@ def instructions(tier: str, months: int) -> dict:
         "plan_name": plan_name,
         "months": months,
         "amount_cents": amount,
-        "currency": settings.billing_currency,
+        "currency": currency,
+        "options": [{"currency": c, "amount_cents": a} for c, a in options.items()],
     }
 
 
@@ -97,13 +120,15 @@ async def submit(
     sent_amount_cents: int,
     momo_transaction_id: str | None,
     proof: bytes,
+    currency: str | None = None,
 ) -> dict:
     sender_name = sender_name.strip()
     if len(sender_name) < 2 or len(sender_name) > 120:
         raise BadPaymentError("Enter the name the money was sent from")
     if sent_amount_cents <= 0:
         raise BadPaymentError("Enter the amount you sent")
-    _, expected = price_for(tier, months)
+    chosen = instructions(tier, months, currency)  # also refuses a currency that isn't offered
+    expected, currency = chosen["amount_cents"], chosen["currency"]
 
     status = await repository.org_status(db, org_id)
     if status is None or status in ("canceled", "suspended"):
@@ -123,7 +148,7 @@ async def submit(
             "tier": tier,
             "months": months,
             "amount_cents": expected,
-            "currency": get_settings().billing_currency,
+            "currency": currency,
             "reference_code": _reference(),
             "sender_name": sender_name,
             "sent_amount_cents": sent_amount_cents,

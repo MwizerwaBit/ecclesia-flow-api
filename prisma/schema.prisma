@@ -39,6 +39,7 @@ model Organization {
   language        String    @default("en")
   status          String    @default("pending")
   tier            String    @default("seed")
+  session_idle_minutes Int    @default(15)
   logo_url        String?
   primary_color   String?
   custom_domain   String?   @unique

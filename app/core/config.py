@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     stripe_publishable_key: str = ""
     billing_currency: str = "usd"
+    # Francs per US dollar, set by the operator. Lets a church pay in the other
+    # of USD / RWF; 0 (default) offers only `billing_currency`. Prices in the
+    # catalogue are in `billing_currency`; the other is converted at this rate.
+    rwf_per_usd: int = 0
     # How churches pay when no Stripe keys are set: "manual" (mobile money, a
     # platform admin approves each payment) or "demo" (test-card page, for
     # demos and tests). Stripe keys, once filled in, take over automatically.

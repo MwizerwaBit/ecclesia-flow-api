@@ -139,15 +139,44 @@ async def require_active_org(request: Request, access: CurrentAccess) -> None:
         )
 
 
-def require_module(name: str, *, free: bool) -> Callable:
-    """Attach to a router whose screens belong to one module. While a church is
-    not paid up, only the free modules work; the rest answer 402 `module_locked`.
-    (`free`: the module is part of the free tier; the catalogue says which.)"""
+class ModuleNotEnabledError(AppError):
+    """403: the church's plan doesn't include this module, or it was switched off."""
 
-    async def _check(access: CurrentAccess) -> None:
-        if access is None or access.state == FULL or free:
+    status_code = 403
+    code = "module_not_enabled"
+
+
+def require_module(
+    name: str, *, free: bool, module_id: str | None = None, plan_includes: Callable[[str], bool] | None = None
+) -> Callable:
+    """Attach to a router whose screens belong to one module.
+
+    Two checks, in this order:
+      1. paid state — while a church is not paid up only the free modules
+         work; the rest answer 402 `module_locked`.
+      2. entitlement — a paid church gets the module when its plan reaches
+         `plan_includes(tier)`, unless a per-church override says otherwise (the church
+         switched it off, or the platform granted it above the plan). Failing
+         answers 403 `module_not_enabled`. Same rule the app shows
+         (org/service.py, src/modules/registry.ts).
+
+    `free`: the module is part of the free tier; the catalogue says which.
+    `plan_includes` is passed in because app/core never imports app/modules.
+    Free modules are core and can't be overridden, so they skip both checks."""
+
+    async def _check(access: CurrentAccess, claims: CurrentClaims, db: TenantDb) -> None:
+        if access is None or free:
             return
-        raise ModuleLockedError(f"{name} is locked until your church's plan is paid")
+        if access.state != FULL:
+            raise ModuleLockedError(f"{name} is locked until your church's plan is paid")
+        if module_id is None or plan_includes is None:
+            return
+        override = await db.orgmoduleoverride.find_unique(
+            where={"tenant_id_module_id": {"tenant_id": claims.tenant_id, "module_id": module_id}}
+        )
+        enabled = override.enabled if override is not None else plan_includes(access.tier)
+        if not enabled:
+            raise ModuleNotEnabledError(f"{name} isn't enabled for your church")
 
     return _check
 
