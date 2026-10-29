@@ -189,6 +189,11 @@ async def review_queue(db: Prisma, reviewer_user_id: str) -> list[dict]:
     )
 
 
+async def user_name(db: Prisma, user_id: str) -> str:
+    rows = await db.query_raw("select first_name || ' ' || last_name as name from users where id = $1::uuid", user_id)
+    return rows[0]["name"] if rows else "Someone"
+
+
 async def reviewer_candidates(db: Prisma) -> list[dict]:
     """Active team members whose role includes events:review."""
     return await db.query_raw(
@@ -419,9 +424,51 @@ async def key_participants_for(db: Prisma, *, group_ids: list[str]) -> list[dict
     )
 
 
-async def create_notifications(db: Prisma, rows: list[dict]) -> None:
-    for row in rows:
-        await db.notification.create(data=row)
+# ── Reminders ───────────────────────────────────────────────────────────
+
+
+async def reminder_candidates(db: Prisma, *, now: datetime, horizon: datetime) -> list[dict]:
+    """Published gatherings that may have an occurrence between `now` and `horizon`,
+    across every church (a platform session). Recurring ones are included whenever
+    they have started, since only their rule says when the next date falls. Churches
+    that are suspended or closed are left out."""
+    return await db.query_raw(
+        """
+        select e.id, e.tenant_id, e.title, e.start_date_time, e.end_date_time, e.is_all_day,
+               e.recurrence_rule, e.group_id, e.visibility, e.created_by_user_id, o.timezone
+        from events e join organizations o on o.id = e.tenant_id
+        where e.status = 'published' and o.status not in ('suspended', 'canceled')
+          and e.start_date_time <= $1::timestamptz
+          and (e.recurrence_rule is not null or e.start_date_time > $2::timestamptz)
+        order by e.start_date_time, e.id
+        """,
+        horizon,
+        now,
+    )
+
+
+async def reminder_recipients(
+    db: Prisma, *, event_id: str, author_user_id: str, group_id: str | None, include_registrants: bool
+) -> list[str]:
+    """Users to remind about one gathering: its author, the active members of its group
+    (leaders included) who have a login, and, for a gathering that isn't private, people
+    who registered with an email that matches an account. Deduplicated; whether each can
+    actually be notified here is the notification service's call."""
+    parts = ["select $2::uuid as user_id"]
+    params: list = [event_id, author_user_id]
+    if group_id:
+        params.append(group_id)
+        parts.append(
+            "select m.user_id from group_memberships gm join members m on m.id = gm.member_id"
+            f" where gm.group_id = ${len(params)}::uuid and gm.status = 'active' and m.user_id is not null"
+        )
+    if include_registrants:
+        parts.append(
+            "select u.id as user_id from event_registrations r join users u on u.email = r.respondent_email"
+            " where r.event_id = $1::uuid and r.respondent_email is not null"
+        )
+    rows = await db.query_raw(" union ".join(parts), *params)
+    return [str(r["user_id"]) for r in rows]
 
 
 # ── Registration forms ──────────────────────────────────────────────────

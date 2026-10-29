@@ -20,6 +20,7 @@ one has been fixed but is still listed — so the lists only ever shrink.
 """
 
 import ast
+import re
 from pathlib import Path
 
 MODULES = Path(__file__).resolve().parent.parent / "app" / "modules"
@@ -170,3 +171,19 @@ def test_core_never_imports_modules():
         if any(n.startswith("app.modules") for n in _imports(tree)):
             offenders.append(path.name)
     assert not offenders, f"app/core must not import app.modules: {offenders}"
+
+
+def test_only_the_notifications_module_writes_notifications():
+    """Every notification goes through notifications.service.notify (dedupe,
+    recipient checks, content rules). A module that inserts the table itself
+    skips all of that."""
+    writes = re.compile(
+        r"\.notification\.(create|create_many|upsert|update|update_many)|(insert\s+into|update)\s+\"?notifications",
+        re.I,
+    )
+    offenders = [
+        _rel(path)
+        for path in sorted(MODULES.rglob("*.py"))
+        if _module_of(path) != "notifications" and writes.search(path.read_text(encoding="utf-8"))
+    ]
+    assert not offenders, f"Write notifications through notifications.service.notify, not directly: {offenders}"

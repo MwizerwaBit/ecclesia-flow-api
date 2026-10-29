@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from prisma import Prisma
+from prisma import Json, Prisma
 
 
 async def list_team(db: Prisma) -> list[dict]:
@@ -172,6 +172,16 @@ async def list_active_membership_ids_excluding(db: Prisma, tenant_id: str, exclu
     return [r["id"] for r in rows]
 
 
+async def user_ids_for_memberships(db: Prisma, tenant_id: str, membership_ids: list[str]) -> list[str]:
+    rows = await db.query_raw(
+        "select user_id from tenant_memberships"
+        " where tenant_id = $1::uuid and id = any($2::uuid[]) and status = 'active'",
+        tenant_id,
+        membership_ids,
+    )
+    return [str(r["user_id"]) for r in rows]
+
+
 async def create_transfer(
     db: Prisma,
     *,
@@ -197,7 +207,7 @@ async def create_transfer(
 
 
 async def add_approval(db: Prisma, transfer_id: str, approvals: list[dict], *, status: str, completed: bool) -> None:
-    data = {"approvals": approvals, "status": status}
+    data = {"approvals": Json(approvals), "status": status}  # a JSON column wants a Json(...), not a bare list
     if completed:
         data["completed_at"] = datetime.now(UTC)
     await db.leadershiptransfer.update(where={"id": transfer_id}, data=data)

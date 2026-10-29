@@ -128,9 +128,9 @@ async def check_collisions(payload: CollisionCheckInput, db: TenantDb):
 @router.post("/notify-conflict", response_model=int, dependencies=[Depends(require_permission("events:create"))])
 async def notify_conflict(payload: NotifyKeyParticipantsInput, claims: CurrentClaims, db: TenantDb):
     """Asks each named leader which of the two clashing gatherings they'll
-    be at. Returns how many were actually reached (some leaders have no
-    portal login yet)."""
-    return await service.notify_key_participants(db, claims.tenant_id, payload)
+    be at. Returns how many were newly reached (some leaders have no portal
+    login yet; someone already asked about this clash isn't asked twice)."""
+    return await service.notify_key_participants(db, claims.tenant_id, claims.sub, payload)
 
 
 @router.get("/{event_id}", response_model=ChurchEventRead, dependencies=[Depends(require_permission("events:read"))])

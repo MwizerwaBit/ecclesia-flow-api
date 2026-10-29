@@ -28,6 +28,8 @@ from app.modules.leadership.router import router as leadership_router
 from app.modules.media.router import router as media_router
 from app.modules.membership.router import router as membership_router
 from app.modules.messaging.router import router as messaging_router
+from app.modules.notifications.router import router as notifications_router
+from app.modules.notifications.router import send_router as notifications_send_router
 from app.modules.org.catalogue import MODULE_BY_ID, tier_at_least
 from app.modules.org.router import router as org_router
 from app.modules.payment_approvals.router import router as billing_platform_router
@@ -49,6 +51,9 @@ ALWAYS_ON = [
     hierarchy_router,
     leadership_router,
     platform_admin_router,
+    # A person's own notifications: a pending or suspended church's people still
+    # need "your payment was rejected", and the bell is not a paid module.
+    notifications_router,
 ]
 #: Each business router with the module it belongs to (None: not a paid module).
 #: While a church isn't paid up, only the free modules answer (require_module).
@@ -62,6 +67,7 @@ BUSINESS = [
     (activity_router, "gatherings"),
     (finance_router, "giving"),
     (messaging_router, "communications"),
+    (notifications_send_router, "communications"),
     (media_router, "media"),
     (certificates_router, "certificates"),
     (affiliations_router, "hierarchy"),

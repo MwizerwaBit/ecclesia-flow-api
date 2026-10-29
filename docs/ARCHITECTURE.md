@@ -82,6 +82,7 @@ inside a repository query.
 | `groups` | groups, group roles, rosters, invitations |
 | `activity` | events, review workflow, attendance |
 | `finance` | funds, donations, pledges |
+| `notifications` | a user's own in-app notifications, unread count, read state and preferences (always-on: not a paid module); the one place that creates notifications (`notify`), email delivery and manual sends. Other modules call its service and it calls none of them ([ADR-0010](adr/0010-notifications-single-writer-and-outbox.md)) |
 | `messaging`, `media`, `certificates`, `portal`, `audit`, `platform_admin` | as named |
 
 Module names in **bold** come from the organisational-foundation work

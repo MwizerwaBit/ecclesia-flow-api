@@ -570,17 +570,67 @@ model MessageTemplate {
 }
 
 model Notification {
-  id         String   @id @default(uuid()) @db.Uuid
-  tenant_id  String   @db.Uuid
-  user_id    String   @db.Uuid
-  type       String
-  title      String
-  body       String
-  is_read    Boolean  @default(false)
-  action_url String?
-  created_at DateTime @default(now()) @db.Timestamptz(6)
+  id            String    @id @default(uuid()) @db.Uuid
+  tenant_id     String    @db.Uuid
+  user_id       String    @db.Uuid
+  type          String
+  title         String
+  body          String
+  is_read       Boolean   @default(false)
+  // Set with is_read, cleared when marked unread. Not recorded for rows read
+  // before 20261029110000, which are not backfilled with a guess.
+  read_at       DateTime? @db.Timestamptz(6)
+  action_url    String?
+  // Partial unique index (tenant_id, user_id, dedupe_key) where not null:
+  // a repeated trigger can't create a second row.
+  dedupe_key    String?
+  resource_type String?
+  resource_id   String?   @db.Uuid
+  actor_user_id String?   @db.Uuid
+  created_at    DateTime  @default(now()) @db.Timestamptz(6)
 
   @@map("notifications")
+}
+
+// One row per manual send (idempotency, rate limit, who-sent-to-whom as counts).
+// Holds no message text and no names.
+model NotificationBroadcast {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenant_id      String   @db.Uuid
+  sender_user_id String   @db.Uuid
+  request_key    String
+  audience       Json     @default("{}")
+  audience_size  Int      @default(0)
+  without_login  Int      @default(0)
+  notified       Int      @default(0)
+  opted_out      Int      @default(0)
+  skipped        Int      @default(0)
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([tenant_id, sender_user_id, request_key])
+  @@map("notification_broadcasts")
+}
+
+// One row per (notification, channel) sent through an outside provider.
+// In-app delivery is the notifications row itself and has no row here.
+model NotificationDelivery {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenant_id       String    @db.Uuid
+  notification_id String    @db.Uuid
+  user_id         String    @db.Uuid
+  channel         String
+  // pending | sent | failed (gave up) | skipped (opted out / no address)
+  status          String    @default("pending")
+  attempts        Int       @default(0)
+  // Short and scrubbed; never the recipient's address.
+  last_error      String?
+  next_attempt_at DateTime? @db.Timestamptz(6)
+  sent_at         DateTime? @db.Timestamptz(6)
+  created_at      DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+
+  @@unique([notification_id, channel])
+  @@map("notification_deliveries")
 }
 
 // ───────────────────────────── Certificates ─────────────────────────────

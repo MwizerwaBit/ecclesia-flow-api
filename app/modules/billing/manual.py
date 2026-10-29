@@ -25,8 +25,10 @@ from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.core.mailer import OutgoingEmail, send_quietly
 from app.modules.audit.service import write_audit
 from app.modules.billing import repository
+from app.modules.notifications import service as notifications_service
 from app.modules.org import lifecycle
 from app.modules.org.catalogue import PLAN_BY_TIER, PURCHASABLE_TIERS
+from app.modules.rbac import service as rbac_service
 
 MAX_MONTHS = 36
 
@@ -218,6 +220,33 @@ async def read_proof(db: Prisma, admin_id: str, payment_id: str) -> tuple[bytes,
     return data, row["proof_mime_type"]
 
 
+BILLING_URL = "/staff/settings/billing"
+
+
+def months_text(months: int) -> str:
+    return f"{months} month" + ("" if months == 1 else "s")
+
+
+async def _tell_church(db: Prisma, tenant_id: str, payment: dict, *, title: str, body: str, key: str) -> None:
+    """The in-app notice of a decision, for whoever can manage the church's billing
+    and for whoever submitted the payment. The email the church already gets goes
+    to its contact address, so this is in-app only (no second email). A pointer, not
+    the platform admin's note: the reason stays in Billing, behind the permission."""
+    admins = await rbac_service.users_with_permission(db, tenant_id, "billing:manage")
+    await notifications_service.notify(
+        db,
+        tenant_id,
+        [*admins, str(payment["submitted_by_user_id"])],
+        "billing",
+        title,
+        body,
+        action_url=BILLING_URL,
+        resource=("billing_manual_payment", str(payment["id"])),
+        dedupe_key=key,
+        email=False,
+    )
+
+
 async def approve(db: Prisma, admin_id: str, payment_id: str, *, note: str, accept_amount_difference: bool) -> dict:
     payment = await _lock(db, payment_id)  # row lock: two admins can't both approve
     if payment["status"] != "pending":
@@ -285,6 +314,15 @@ async def approve(db: Prisma, admin_id: str, payment_id: str, *, note: str, acce
             "amount_difference_accepted": accept_amount_difference and differs,
         },
     )
+    await _tell_church(
+        db,
+        tenant_id,
+        payment,
+        title="Payment approved",
+        body=f"{months_text(payment['months'])} of the {PLAN_BY_TIER[payment['tier']].name} plan were added. "
+        f"Your plan now runs until {until:%d %B %Y}.",
+        key=f"billing.payment_approved:{payment_id}",
+    )
     if org and org["contact_email"]:
         await send_quietly(
             OutgoingEmail(
@@ -313,6 +351,14 @@ async def reject(db: Prisma, admin_id: str, payment_id: str, *, reason: str) -> 
         resource_type="billing_manual_payment",
         resource_id=payment_id,
         metadata={"reason": reason},
+    )
+    await _tell_church(
+        db,
+        tenant_id,
+        payment,
+        title="Payment could not be approved",
+        body="We couldn't approve the payment you sent. Open Billing to see why and send it again.",
+        key=f"billing.payment_rejected:{payment_id}",
     )
     org = await repository.org_contact(db, tenant_id)
     if org and org["contact_email"]:

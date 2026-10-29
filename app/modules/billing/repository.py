@@ -331,7 +331,7 @@ async def claim_due_reminders(db: Prisma, within_days: int) -> list[dict]:
           and s.current_period_end > now()
           and s.current_period_end <= now() + make_interval(days => $1::int)
           and s.renewal_reminder_for is distinct from s.current_period_end
-        returning o.display_name, o.contact_email, s.current_period_end
+        returning s.tenant_id, o.display_name, o.contact_email, s.current_period_end
         """,
         within_days,
     )
