@@ -418,6 +418,7 @@ model Event {
   location           String?
   start_date_time    DateTime  @db.Timestamptz(6)
   end_date_time      DateTime? @db.Timestamptz(6)
+  is_all_day Boolean @default(false)
   is_recurring       Boolean   @default(false)
   recurrence_rule    String?
   status             String    @default("draft")

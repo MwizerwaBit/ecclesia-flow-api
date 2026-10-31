@@ -66,6 +66,25 @@ permission by default (`SYSTEM_ROLE_PERMISSIONS`).
 | `events:update` | | | | ✓ | ✓ | ✓ |
 | `events:review` | | | | | ✓ | ✓ |
 
+**What `events:read` alone shows.** The permission is necessary, not sufficient. A person who holds
+only `events:read` (the Member role) sees just what a member may see: **published** events that are
+public or members-only, plus private events of groups they are an *active* member of (an unaccepted
+invitation does not count). Drafts, events waiting for review, canceled events, other groups' private
+events, review comments, registration questions and history are answered with the same 404 as an event
+that does not exist. This rule is applied on every event read route (`GET /events`, `/events/calendar`,
+`/events/{id}`, `/events/{id}/occurrences`, `/events/{id}/fields`) from one place
+(`activity.repository._MEMBER_VISIBLE`, `activity.service.Viewer`).
+
+People who can **create, update or review** events ("managers") are not limited by status or visibility:
+they see every event inside their unit scope, drafts included. `GET /events/{id}/history` (who changed
+what) needs `events:update` or `events:review`. Editing a published event is allowed for anyone with
+`events:update` in scope and is recorded in the audit log with before/after values; a second reviewer is
+not required (roles without `events:review` still cannot publish). The public calendar
+(`GET /churches/{slug}/calendar`) shows only published, public events and carries no status, group or
+unit. Attendance routes still follow `attendance:read` / `attendance:create` plus unit scope, not the
+member visibility rule (known gap: an attendance-only role can read the attendance of an event it
+cannot otherwise see).
+
 ### Giving — offerings, funds and pledges
 
 | Permission | Sensitive | MFA | Member | Staff | Admin | Leader |
