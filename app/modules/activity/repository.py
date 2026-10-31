@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from prisma import Json, Prisma
+from prisma import Prisma
 from prisma.models import AttendanceRecord, Event
 
 _LIST_COLUMNS = """
@@ -448,11 +448,12 @@ async def reminder_candidates(db: Prisma, *, now: datetime, horizon: datetime) -
 
 
 async def reminder_recipients(
-    db: Prisma, *, event_id: str, author_user_id: str, group_id: str | None, include_registrants: bool
+    db: Prisma, *, event_id: str, author_user_id: str, group_id: str | None, registrant_emails: list[str]
 ) -> list[str]:
     """Users to remind about one gathering: its author, the active members of its group
     (leaders included) who have a login, and, for a gathering that isn't private, people
-    who registered with an email that matches an account. Deduplicated; whether each can
+    whose registration email (``registrant_emails``, from the Forms module) matches an
+    account. Deduplicated; whether each can
     actually be notified here is the notification service's call."""
     parts = ["select $2::uuid as user_id"]
     params: list = [event_id, author_user_id]
@@ -462,63 +463,32 @@ async def reminder_recipients(
             "select m.user_id from group_memberships gm join members m on m.id = gm.member_id"
             f" where gm.group_id = ${len(params)}::uuid and gm.status = 'active' and m.user_id is not null"
         )
-    if include_registrants:
-        parts.append(
-            "select u.id as user_id from event_registrations r join users u on u.email = r.respondent_email"
-            " where r.event_id = $1::uuid and r.respondent_email is not null"
-        )
+    if registrant_emails:
+        params.append(registrant_emails)
+        parts.append(f"select u.id as user_id from users u where lower(u.email) = any(${len(params)}::text[])")
     rows = await db.query_raw(" union ".join(parts), *params)
     return [str(r["user_id"]) for r in rows]
 
 
 # ── Registration forms ──────────────────────────────────────────────────
+# The questions and responses live in the Forms module; this is only what it needs
+# to know about the event it belongs to.
 
 
-async def list_registration_fields(db: Prisma, event_id: str) -> list[dict]:
-    rows = await db.eventregistrationfield.find_many(where={"event_id": event_id}, order={"position": "asc"})
-    return [r.model_dump() for r in rows]
-
-
-async def replace_registration_fields(db: Prisma, tenant_id: str, event_id: str, fields: list[dict]) -> list[dict]:
-    """Full replace: the caller always sends the whole form in display order.
-    Safe because responses snapshot each field's label at submission time
-    rather than pointing back at this row (see EventRegistrationField).
-
-    Runs directly on the request's own transaction rather than opening a
-    nested one — ``db`` here is already inside ``tenant_session``'s
-    transaction, and a second ``db.tx()`` on top of it put inserts outside
-    the scope where the RLS session variable is visible, tripping
-    ``tenant_isolation``'s WITH CHECK."""
-    await db.eventregistrationfield.delete_many(where={"event_id": event_id})
-    created = []
-    for position, field in enumerate(fields):
-        row = await db.eventregistrationfield.create(
-            data={**field, "tenant_id": tenant_id, "event_id": event_id, "position": position}
-        )
-        created.append(row.model_dump())
-    return created
+async def event_form_context(db: Prisma, event_id: str) -> dict | None:
+    rows = await db.query_raw("select id, title, unit_id, created_by_user_id from events where id = $1::uuid", event_id)
+    return rows[0] if rows else None
 
 
 async def get_public_event_row(db: Prisma, event_id: str) -> dict | None:
     rows = await db.query_raw(
         """
         select e.id, e.title, e.type, e.description, e.location, e.online_url, e.start_date_time, e.end_date_time,
-               e.is_recurring, e.recurrence_rule, e.cover_image_url, e.theme, e.is_all_day
+               e.is_recurring, e.recurrence_rule, e.cover_image_url, e.theme, e.is_all_day,
+               e.unit_id, e.created_by_user_id
         from events e
         where e.id = $1::uuid and e.status = 'published' and e.visibility = 'public'
         """,
         event_id,
     )
     return rows[0] if rows else None
-
-
-async def create_registration(db: Prisma, tenant_id: str, event_id: str, data: dict) -> dict:
-    row = await db.eventregistration.create(
-        data={**data, "answers": Json(data["answers"]), "tenant_id": tenant_id, "event_id": event_id}
-    )
-    return row.model_dump()
-
-
-async def list_registrations(db: Prisma, event_id: str) -> list[dict]:
-    rows = await db.eventregistration.find_many(where={"event_id": event_id}, order={"created_at": "desc"})
-    return [r.model_dump() for r in rows]

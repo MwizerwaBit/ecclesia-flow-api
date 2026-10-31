@@ -102,6 +102,11 @@ pull requests ([CONTRIBUTING.md](CONTRIBUTING.md#branching-and-commits)). The
    production *before* switching traffic to the new code. Expand/contract
    ([MIGRATIONS.md](MIGRATIONS.md)) means the old code still works on the new
    schema while it runs.
+   *Release with the forms migrations (20261031090000, 20261031090100):* after traffic has moved to the new
+   code, run `docs/migration-aids/forms-module-catch-up.sql` once as the database owner. It copies event
+   registrations the previous release saved between the migration and the switch (safe to repeat). To roll the
+   application back instead, redeploy the previous tag and run `docs/migration-aids/forms-module-copy-back.sql`.
+   Details and measurements: [FORMS_MIGRATION_VERIFICATION.md](FORMS_MIGRATION_VERIFICATION.md).
 6. **Verify.** `/health/ready` passes on every instance. Error rate and
    latency hold steady for 15 minutes. Run the smoke test against production.
 7. **Roll back** if verification fails: redeploy the previous tag. The

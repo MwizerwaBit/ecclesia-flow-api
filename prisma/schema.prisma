@@ -994,14 +994,38 @@ model EventReview {
   @@map("event_reviews")
 }
 
-// Custom registration questions attached to an event, shown on its public
-// share link before someone RSVPs. Answers are captured against the field's
-// label at submission time (see EventRegistration.answers), not a field id,
-// so editing or removing a question later never corrupts an existing response.
-model EventRegistrationField {
+// ───────────────────────────── Forms ─────────────────────────────
+//
+// Questions and the answers to them (modules/forms). A form is either standalone
+// or owned by something else (owner_kind/owner_id: today an event's registration
+// form) — an opaque pointer with no relation, so Forms never reads the owner's
+// tables and the owner never reads these. The old event_registration_fields and
+// event_registrations tables were copied here by migration 20261031090000 and are
+// left unused in the database until a later migration drops them.
+
+model Form {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenant_id          String    @db.Uuid
+  unit_id            String?   @db.Uuid
+  owner_kind         String? // 'event'
+  owner_id           String?   @db.Uuid
+  title              String
+  description        String?
+  status             String    @default("draft") // 'draft' | 'published' | 'closed'
+  public_key         String    @unique
+  created_by_user_id String?   @db.Uuid
+  created_at         DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime  @default(now()) @db.Timestamptz(6)
+  published_at       DateTime? @db.Timestamptz(6)
+  closed_at          DateTime? @db.Timestamptz(6)
+
+  @@map("forms")
+}
+
+model FormField {
   id         String   @id @default(uuid()) @db.Uuid
   tenant_id  String   @db.Uuid
-  event_id   String   @db.Uuid
+  form_id    String   @db.Uuid
   label      String
   field_type String // 'text' | 'single_choice' | 'checkbox'
   options    String[] @default([])
@@ -1009,20 +1033,23 @@ model EventRegistrationField {
   position   Int
   created_at DateTime @default(now()) @db.Timestamptz(6)
 
-  @@map("event_registration_fields")
+  @@map("form_fields")
 }
 
-model EventRegistration {
+// Add-only: the database refuses UPDATE (trigger) and the app roles have no
+// UPDATE/DELETE grant. form_snapshot is the form as the respondent saw it.
+model FormSubmission {
   id               String   @id @default(uuid()) @db.Uuid
   tenant_id        String   @db.Uuid
-  event_id         String   @db.Uuid
+  form_id          String   @db.Uuid
   respondent_name  String
   respondent_email String?
   respondent_phone String?
   answers          Json     @default("{}")
+  form_snapshot    Json
   created_at       DateTime @default(now()) @db.Timestamptz(6)
 
-  @@map("event_registrations")
+  @@map("form_submissions")
 }
 
 // ───────────────────────────── Organisation structure ─────────────────────────────

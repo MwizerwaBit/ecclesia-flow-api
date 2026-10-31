@@ -113,6 +113,25 @@ audited with its audience and counts but never its text.
 | `announcements:create` | | | | ✓ | ✓ | ✓ |
 | `notifications:send` | ✓ | | | ✓ | ✓ | ✓ |
 
+### Forms — questions people answer, and what they said
+
+Standalone forms are managed with `forms:*`; an event's registration form is managed with the event's own
+permissions (`events:update`, and the event's branch), through the `/events/{id}/...` routes. The `/forms`
+API does not see an event's form at all (404): the event decides who reaches it.
+
+`forms:responses` is separate from `forms:manage` because responses hold names and contact details. Reading
+one response and every export are audited (counts, never contents). A branch-scoped session reaches its own
+branch's forms and reads church-wide ones; changing a church-wide form needs a whole-church session
+(`403 out_of_scope`). The public link (`/churches/{slug}/forms/{key}`, no session) shows a published or
+closed form's questions and nothing else, takes at most 5 submissions a minute and 20 an hour per address,
+and answers a draft, an event form or a wrong key with 404.
+
+| Permission | Sensitive | MFA | Member | Staff | Admin | Leader |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| `forms:read` | | | | ✓ | ✓ | ✓ |
+| `forms:manage` | | | | ✓ | ✓ | ✓ |
+| `forms:responses` | ✓ | | | ✓ | ✓ | ✓ |
+
 ### Administration — team, roles and organisation settings
 
 | Permission | Sensitive | MFA | Member | Staff | Admin | Leader |

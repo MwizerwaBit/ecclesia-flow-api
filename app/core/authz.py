@@ -199,6 +199,26 @@ async def ensure_event_writable(db: Prisma, scope: Scope, event_id: str) -> None
         raise ForbiddenError("Church-wide events can only be changed by whole-church staff", code="out_of_scope")
 
 
+async def _standalone_form_unit(db: Prisma, form_id: str) -> tuple[bool, str | None]:
+    # Forms owned by something else (an event's registration form) are reached through
+    # their owner and its own checks, never by id here: to this API they don't exist.
+    rows = await db.query_raw("select unit_id from forms where id = $1::uuid and owner_kind is null", form_id)
+    return (True, rows[0]["unit_id"]) if rows else (False, None)
+
+
+async def ensure_form_readable(db: Prisma, scope: Scope, form_id: str) -> None:
+    exists, unit_id = await _standalone_form_unit(db, form_id)
+    if not exists or not scope.shared_readable(unit_id):
+        raise NotFoundError("No such form")
+
+
+async def ensure_form_writable(db: Prisma, scope: Scope, form_id: str) -> None:
+    await ensure_form_readable(db, scope, form_id)
+    _, unit_id = await _standalone_form_unit(db, form_id)
+    if not scope.unit_writable(unit_id):
+        raise ForbiddenError("Church-wide forms can only be changed by whole-church staff", code="out_of_scope")
+
+
 async def ensure_unit_in_scope(db: Prisma, scope: Scope, unit_id: str | None) -> None:
     """For hierarchy edits and staff assignments: the target unit itself."""
     if unit_id is not None and not scope.unit_writable(unit_id):

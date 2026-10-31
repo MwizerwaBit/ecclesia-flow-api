@@ -178,7 +178,7 @@ def test_only_the_notifications_module_writes_notifications():
     recipient checks, content rules). A module that inserts the table itself
     skips all of that."""
     writes = re.compile(
-        r"\.notification\.(create|create_many|upsert|update|update_many)|(insert\s+into|update)\s+\"?notifications",
+        r"\.notification\.(create|create_many|upsert|update|update_many)\b|(insert\s+into|update)\s+\"?notifications\b",
         re.I,
     )
     offenders = [
@@ -187,3 +187,36 @@ def test_only_the_notifications_module_writes_notifications():
         if _module_of(path) != "notifications" and writes.search(path.read_text(encoding="utf-8"))
     ]
     assert not offenders, f"Write notifications through notifications.service.notify, not directly: {offenders}"
+
+
+def _strings(tree: ast.AST) -> list[str]:
+    return [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+def test_events_and_forms_depend_on_each_other_only_through_the_forms_service():
+    """Forms owns definitions, questions and submissions; Events owns events and who may
+    sign up. Events reaches Forms through ``forms.service`` and ``forms.schemas`` (an
+    owner is an opaque kind + id), never its tables or repository; Forms never reaches
+    back into Events, so there is no cycle."""
+    forms_sql = re.compile(r"\b(from|join|into|update)\s+(forms|form_fields|form_submissions)\b", re.I)
+    forms_models = {"form", "formfield", "formsubmission"}
+    events_sql = re.compile(r"\b(from|join|into|update)\s+events\b", re.I)
+    events_models = {"event", "eventregistration", "eventregistrationfield"}
+
+    for path, tree in _module_files():
+        mod = _module_of(path)
+        if mod not in {"activity", "forms"}:
+            continue
+        imports = _imports(tree)
+        models = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        sql = " ".join(_strings(tree))
+        if mod == "activity":
+            allowed = {"app.modules.forms.service", "app.modules.forms.schemas"}
+            used = {n for n in imports if n.startswith("app.modules.forms")} - {"app.modules.forms"}
+            assert all(any(u == a or u.startswith(a + ".") for a in allowed) for u in used), (_rel(path), used)
+            assert not forms_sql.search(sql), f"{_rel(path)} queries Forms' tables; use forms.service"
+            assert not (models & forms_models), f"{_rel(path)} uses Forms' models; use forms.service"
+        else:
+            assert not any(n.startswith("app.modules.activity") for n in imports), f"{_rel(path)} imports Events"
+            assert not events_sql.search(sql), f"{_rel(path)} queries Events' tables"
+            assert not (models & events_models), f"{_rel(path)} uses Events' models"

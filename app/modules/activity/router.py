@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 
 from app.core.authz import (
     CurrentScope,
@@ -13,6 +13,7 @@ from app.core.authz import (
 from app.core.deps import CurrentClaims, PreTenantDb, TenantDb, require_any_permission, require_permission
 from app.core.pagination import PaginatedRoute
 from app.core.rate_limit import limiter
+from app.core.responses import attachment_response
 from app.modules.activity import service
 from app.modules.activity.schemas import (
     AttendanceMarkInput,
@@ -36,6 +37,8 @@ from app.modules.activity.schemas import (
     PublicEvent,
     PublicEventDetail,
     RegistrationFieldRead,
+    RegistrationStatusInput,
+    RegistrationStatusRead,
     ReviewDecisionInput,
     ReviewerOption,
     SetRegistrationFieldsInput,
@@ -294,7 +297,7 @@ async def set_registration_fields(
     """Replaces the whole registration form, in the order given."""
     await ensure_event_writable(db, scope, event_id)
     fields = [f.model_dump() for f in payload.fields]
-    return await service.set_registration_fields(db, claims.tenant_id, event_id, fields)
+    return await service.set_registration_fields(db, claims.tenant_id, event_id, fields, claims.sub)
 
 
 @router.get(
@@ -308,6 +311,43 @@ async def list_responses(event_id: str, db: TenantDb, scope: CurrentScope):
     # runs the event, not for anyone who can merely see the calendar.
     await ensure_event_writable(db, scope, event_id)
     return await service.list_registrations(db, event_id)
+
+
+# Before nothing else here takes /responses/<something>, but kept next to the list it exports.
+@router.get(
+    "/{event_id}/responses/export",
+    response_class=Response,
+    dependencies=[Depends(require_permission("events:update"))],
+)
+async def export_responses(event_id: str, claims: CurrentClaims, scope: CurrentScope, db: TenantDb):
+    """The responses as a CSV file, the same rows and columns as the list."""
+    await ensure_event_writable(db, scope, event_id)
+    filename, body = await service.export_registrations(db, claims.tenant_id, event_id, claims.sub)
+    return attachment_response(body.encode("utf-8"), "text/csv; charset=utf-8", filename)
+
+
+@router.get(
+    "/{event_id}/registration",
+    response_model=RegistrationStatusRead,
+    dependencies=[Depends(require_permission("events:update"))],
+)
+async def get_registration_status(event_id: str, db: TenantDb, scope: CurrentScope):
+    await ensure_event_writable(db, scope, event_id)
+    return {"status": await service.registration_status(db, event_id)}
+
+
+@router.put(
+    "/{event_id}/registration",
+    response_model=RegistrationStatusRead,
+    dependencies=[Depends(require_permission("events:update"))],
+)
+async def set_registration_status(
+    event_id: str, payload: RegistrationStatusInput, claims: CurrentClaims, scope: CurrentScope, db: TenantDb
+):
+    """Close sign-ups on the public link, or open them again. Responses are kept."""
+    await ensure_event_writable(db, scope, event_id)
+    status = await service.set_registration_status(db, claims.tenant_id, event_id, payload.status, claims.sub)
+    return {"status": status}
 
 
 # ───────────────────────────── Public ─────────────────────────────
