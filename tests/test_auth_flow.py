@@ -143,6 +143,37 @@ async def test_step_up_gates_mfa_disable(client, church_payload):
     assert with_step_up.status_code == 204
 
 
+async def test_starting_mfa_setup_cannot_switch_off_an_account_that_has_it(client, church_payload):
+    payload = church_payload("mfa-reset")
+    reg = await client.post("/api/v1/auth/register", json=payload)
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+
+    first = (await client.post("/api/v1/auth/mfa/setup", headers=headers)).json()
+    secret = first["secret"]
+    verify = await client.post("/api/v1/auth/mfa/verify", headers=headers, json={"code": pyotp.TOTP(secret).now()})
+    assert verify.status_code == 204
+
+    # A session (say, a stolen one) asks to "set up" again: refused, nothing changes.
+    again = await client.post("/api/v1/auth/mfa/setup", headers=headers)
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "mfa_already_enabled"
+
+    login = await client.post("/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]})
+    assert login.json().get("mfa_required") is True, "two-step sign-in must still be on"
+    done = await client.post(
+        "/api/v1/auth/mfa/challenge",
+        json={"challenge_token": login.json()["challenge_token"], "code": pyotp.TOTP(secret).now()},
+    )
+    assert done.status_code == 200, "the original authenticator must still work"
+
+    # The legitimate way to change it: turn it off with a code, then set it up again.
+    step_up = await client.post("/api/v1/auth/step-up", headers=headers, json={"code": pyotp.TOTP(secret).now()})
+    token = step_up.json()["step_up_token"]
+    off = await client.post("/api/v1/auth/mfa/disable", headers={**headers, "X-Step-Up-Token": token})
+    assert off.status_code == 204
+    assert (await client.post("/api/v1/auth/mfa/setup", headers=headers)).status_code == 200
+
+
 async def test_tenant_switch_rejects_other_users_membership(client, church_payload):
     a = await client.post("/api/v1/auth/register", json=church_payload("tenanta"))
     b = await client.post("/api/v1/auth/register", json=church_payload("tenantb"))

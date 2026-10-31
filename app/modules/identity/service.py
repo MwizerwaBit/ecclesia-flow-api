@@ -726,6 +726,15 @@ async def accept_invite(
 
 
 async def start_mfa_setup(db: Prisma, user: User) -> MfaSetupResponse:
+    # Setting up writes a new secret and leaves two-step sign-in off until it is
+    # confirmed, so on an account that already has it that would silently switch it
+    # off for anyone holding a session. Changing the device means turning it off
+    # first, which needs a current code (require_step_up on /mfa/disable).
+    if user.mfa_enabled:
+        raise ConflictError(
+            "Two-step sign-in is already on. Turn it off first (this asks for a code) to set it up again.",
+            code="mfa_already_enabled",
+        )
     secret = generate_totp_secret()
     backup_codes = generate_backup_codes()
     await repository.set_mfa(
