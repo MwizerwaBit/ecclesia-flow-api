@@ -20,3 +20,4 @@ ADR from the pull request that implements it (the PR template asks).
 | [0008](0008-pagination-in-headers.md) | Pagination metadata in headers; bodies stay arrays | Accepted |
 | [0009](0009-mvc-layering-and-boundary-tests.md) | MVC layering mapped onto modules, enforced by boundary tests | Accepted |
 | [0010](0010-notifications-single-writer-and-outbox.md) | Notifications: one writer, an outbox for email, reading always on | Accepted |
+| [0011](0011-forms-module-and-event-registration.md) | Forms: one module for questions and answers, events keep their own rules | Accepted |

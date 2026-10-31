@@ -19,6 +19,8 @@ from app.modules.activity.schemas import (
     NotifyKeyParticipantsInput,
 )
 from app.modules.audit.service import history_for, write_audit
+from app.modules.forms import service as forms_service
+from app.modules.forms.service import OWNER_EVENT, FormClosedError
 from app.modules.groups import service as groups_service
 from app.modules.hierarchy import service as hierarchy_service
 from app.modules.notifications import service as notifications_service
@@ -899,15 +901,57 @@ async def notify_key_participants(
 
 async def get_registration_fields(db: Prisma, event_id: str, viewer: Viewer | None = None) -> list[dict]:
     await _require_visible(db, event_id, viewer)
-    return await repository.list_registration_fields(db, event_id)
+    return await forms_service.owned_fields(db, OWNER_EVENT, event_id)
 
 
-async def set_registration_fields(db: Prisma, tenant_id: str, event_id: str, fields: list[dict]) -> list[dict]:
-    return await repository.replace_registration_fields(db, tenant_id, event_id, fields)
+async def _form_context(db: Prisma, event_id: str) -> dict:
+    event = await repository.event_form_context(db, event_id)
+    if event is None:
+        raise NotFoundError("No such event")
+    return event
+
+
+async def set_registration_fields(
+    db: Prisma, tenant_id: str, event_id: str, fields: list[dict], actor_user_id: str
+) -> list[dict]:
+    event = await _form_context(db, event_id)
+    return await forms_service.set_owned_fields(
+        db,
+        tenant_id,
+        OWNER_EVENT,
+        event_id,
+        title=event["title"],
+        unit_id=event["unit_id"],
+        fields=fields,
+        actor_user_id=actor_user_id,
+    )
+
+
+async def registration_status(db: Prisma, event_id: str) -> str:
+    return await forms_service.owned_status(db, OWNER_EVENT, event_id)
+
+
+async def set_registration_status(db: Prisma, tenant_id: str, event_id: str, status: str, actor_user_id: str) -> str:
+    event = await _form_context(db, event_id)
+    return await forms_service.set_owned_status(
+        db,
+        tenant_id,
+        OWNER_EVENT,
+        event_id,
+        status,
+        title=event["title"],
+        unit_id=event["unit_id"],
+        actor_user_id=actor_user_id,
+    )
 
 
 async def list_registrations(db: Prisma, event_id: str) -> list[dict]:
-    return await repository.list_registrations(db, event_id)
+    return await forms_service.owned_submissions(db, OWNER_EVENT, event_id)
+
+
+async def export_registrations(db: Prisma, tenant_id: str, event_id: str, actor_user_id: str) -> tuple[str, str]:
+    event = await _form_context(db, event_id)
+    return await forms_service.export_owned(db, tenant_id, actor_user_id, OWNER_EVENT, event_id, title=event["title"])
 
 
 async def public_event_detail(db: Prisma, slug: str, event_id: str) -> dict:
@@ -918,24 +962,30 @@ async def public_event_detail(db: Prisma, slug: str, event_id: str) -> dict:
         raise NotFoundError("No such gathering")
     _, zone = await _tz(db)
     decorated = _decorate(row, zone=zone)
-    decorated["registration_fields"] = await repository.list_registration_fields(db, event_id)
+    decorated["registration_fields"] = await forms_service.owned_fields(db, OWNER_EVENT, event_id)
+    decorated["registration_open"] = await forms_service.owned_is_open(db, OWNER_EVENT, event_id)
     return decorated
 
 
 async def submit_registration(db: Prisma, slug: str, event_id: str, payload: dict) -> dict:
     org = await tenant_service.get_live_org_by_slug(db, slug)
     await set_tenant_context(db, org.id)
-    if await repository.get_public_event_row(db, event_id) is None:
+    event = await repository.get_public_event_row(db, event_id)
+    if event is None:
         raise NotFoundError("No such gathering")
-    fields = await repository.list_registration_fields(db, event_id)
-    answers = payload.get("answers") or {}
-    for field in fields:
-        if not field["required"]:
-            continue
-        value = answers.get(field["label"])
-        empty = (
-            value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, list) and not value)
+    try:
+        return await forms_service.submit_owned(
+            db,
+            org.id,
+            OWNER_EVENT,
+            event_id,
+            payload,
+            title=event["title"],
+            unit_id=event["unit_id"],
+            # Whoever runs the event hears that someone signed up (a pointer, never the answers).
+            notify_user_ids=[str(event["created_by_user_id"])] if event["created_by_user_id"] else [],
+            notify_link=f"/staff/events/{event_id}/responses",
+            notify_type="event",
         )
-        if empty:
-            raise AppError(f'"{field["label"]}" is required')
-    return await repository.create_registration(db, org.id, event_id, payload)
+    except FormClosedError:
+        raise ConflictError("Sign-ups for this gathering are closed", code="registration_closed") from None

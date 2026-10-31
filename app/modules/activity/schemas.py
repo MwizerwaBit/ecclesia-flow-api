@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, HttpUrl, StringConstraints, field_validator, model_validator
 
 from app.modules.activity import recurrence
+from app.modules.forms.schemas import FieldInput, FieldRead, FieldType, SetFieldsInput, SubmissionInput, SubmissionRead
 
 EventType = Literal["service", "meeting", "event", "prayer", "outreach", "other"]
 Visibility = Literal["public", "members", "private"]
@@ -288,57 +289,44 @@ class NotifyKeyParticipantsInput(BaseModel):
 
 # ───────────────────────────── Registration forms ─────────────────────────────
 
-RegistrationFieldType = Literal["text", "single_choice", "checkbox"]
-FieldLabel = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
-FieldOption = Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
+# The questions and answers themselves are the Forms module's contract; these keep the
+# names (and so the API documentation) event clients already know.
+RegistrationFieldType = FieldType
 
 
-class RegistrationFieldInput(BaseModel):
-    label: FieldLabel
-    field_type: RegistrationFieldType
-    options: list[FieldOption] = Field(default_factory=list, max_length=20)
-    required: bool = False
-
-    @model_validator(mode="after")
-    def _choice_types_need_options(self):
-        if self.field_type in ("single_choice", "checkbox") and not self.options:
-            raise ValueError("Choice fields need at least one option")
-        if self.field_type == "text" and self.options:
-            raise ValueError("Text fields don't take options")
-        return self
+class RegistrationFieldInput(FieldInput):
+    pass
 
 
-class RegistrationFieldRead(RegistrationFieldInput):
-    id: str
-    position: int
+class RegistrationFieldRead(FieldRead):
+    pass
 
 
-class SetRegistrationFieldsInput(BaseModel):
-    #: The whole form, in display order — replaces whatever was there before.
-    fields: list[RegistrationFieldInput] = Field(default_factory=list, max_length=30)
+class SetRegistrationFieldsInput(SetFieldsInput):
+    pass
+
+
+class RegistrationStatusInput(BaseModel):
+    #: "closed" stops the public link taking sign-ups; "published" opens it again.
+    status: Literal["published", "closed"]
+
+
+class RegistrationStatusRead(BaseModel):
+    status: Literal["published", "closed"]
 
 
 class PublicEventDetail(PublicEvent):
     registration_fields: list[RegistrationFieldRead]
+    #: False once sign-ups have been closed: the page says so instead of showing the form.
+    registration_open: bool = True
 
 
-class EventRegistrationInput(BaseModel):
-    respondent_name: Annotated[str, StringConstraints(min_length=1, max_length=200, strip_whitespace=True)]
-    respondent_email: Annotated[str, StringConstraints(max_length=320)] | None = None
-    respondent_phone: Annotated[str, StringConstraints(max_length=40)] | None = None
-    #: Keyed by the field's label, not its id — see EventRegistrationField in
-    #: schema.prisma for why. Value is a string for text/single_choice, a
-    #: list of strings for checkbox.
-    answers: dict[str, str | list[str]] = Field(default_factory=dict)
+class EventRegistrationInput(SubmissionInput):
+    pass
 
 
-class EventRegistrationRead(BaseModel):
-    id: str
-    respondent_name: str
-    respondent_email: str | None
-    respondent_phone: str | None
-    answers: dict[str, str | list[str]]
-    created_at: datetime
+class EventRegistrationRead(SubmissionRead):
+    pass
 
 
 # ───────────────────────────── Calendar window ─────────────────────────────

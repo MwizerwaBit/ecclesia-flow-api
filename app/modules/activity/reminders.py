@@ -26,6 +26,8 @@ from datetime import UTC, datetime, timedelta
 from app.core.database import platform_session
 from app.core.timezones import church_tz
 from app.modules.activity import recurrence, repository
+from app.modules.forms import service as forms_service
+from app.modules.forms.service import OWNER_EVENT
 from app.modules.notifications import service as notifications_service
 
 logger = logging.getLogger("ecclesia_flow.events")
@@ -72,7 +74,11 @@ async def _remind(db, row: dict, occurrence: datetime, stage: str, zone) -> int:
         event_id=str(row["id"]),
         author_user_id=str(row["created_by_user_id"]),
         group_id=str(row["group_id"]) if row["group_id"] else None,
-        include_registrants=row["visibility"] != "private",
+        registrant_emails=(
+            []
+            if row["visibility"] == "private"
+            else await forms_service.owned_respondent_emails(db, OWNER_EVENT, str(row["id"]))
+        ),
     )
     result = await notifications_service.notify(
         db,

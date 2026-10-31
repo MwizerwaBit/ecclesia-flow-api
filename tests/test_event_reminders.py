@@ -64,10 +64,21 @@ async def _event(client, lead, *, start, title="Choir practice", group_id=None, 
 
 
 async def _register(tenant_id: str, event_id: str, email: str) -> None:
+    """Someone signed up for the event. Seeded straight into the Forms tables because the
+    public link refuses drafts and private gatherings, and the reminders must ignore those too."""
     async with platform_session() as db:
         await db.execute_raw(
-            "insert into event_registrations (id, tenant_id, event_id, respondent_name, respondent_email)"
-            " values (gen_random_uuid(), $1::uuid, $2::uuid, 'Someone', $3)",
+            "insert into forms (tenant_id, owner_kind, owner_id, title, status, public_key)"
+            " values ($1::uuid, 'event', $2::uuid, 'Registration', 'published',"
+            " replace(gen_random_uuid()::text, '-', ''))"
+            " on conflict (tenant_id, owner_kind, owner_id) where owner_kind is not null do nothing",
+            tenant_id,
+            event_id,
+        )
+        await db.execute_raw(
+            "insert into form_submissions (tenant_id, form_id, respondent_name, respondent_email, form_snapshot)"
+            ' select $1::uuid, id, \'Someone\', $3, \'{"form_title": "Registration", "fields": []}\'::jsonb'
+            " from forms where owner_kind = 'event' and owner_id = $2::uuid",
             tenant_id,
             event_id,
             email,

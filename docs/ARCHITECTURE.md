@@ -83,6 +83,7 @@ inside a repository query.
 | `activity` | events, review workflow, attendance |
 | `finance` | funds, donations, pledges |
 | `notifications` | a user's own in-app notifications, unread count, read state and preferences (always-on: not a paid module); the one place that creates notifications (`notify`), email delivery and manual sends. Other modules call its service and it calls none of them ([ADR-0010](adr/0010-notifications-single-writer-and-outbox.md)) |
+| `forms` | forms, their questions and the responses people send (standalone forms, and the registration form an event owns). Public link, server-side validation, add-only responses that keep the questions they answered, audited CSV export. Events reaches it only through `forms.service`; it never reaches back ([ADR-0011](adr/0011-forms-module-and-event-registration.md)) |
 | `messaging`, `media`, `certificates`, `portal`, `audit`, `platform_admin` | as named |
 
 Module names in **bold** come from the organisational-foundation work

@@ -22,6 +22,8 @@ from app.modules.certificates.router import router as certificates_router
 from app.modules.dataexchange.router import router as dataexchange_router
 from app.modules.family.router import router as family_router
 from app.modules.finance.router import router as finance_router
+from app.modules.forms.router import public_router as forms_public_router
+from app.modules.forms.router import router as forms_router
 from app.modules.groups.router import router as groups_router
 from app.modules.hierarchy.router import router as hierarchy_router
 from app.modules.identity.router import router as identity_router
@@ -43,7 +45,7 @@ from app.modules.reports.router import router as reports_router
 from app.modules.team.router import router as team_router
 from app.modules.tenant.router import router as tenant_router
 
-PUBLIC = [identity_router, tenant_router, certificates_public_router, events_public_router]
+PUBLIC = [identity_router, tenant_router, certificates_public_router, events_public_router, forms_public_router]
 ALWAYS_ON = [
     org_router,
     billing_router,
@@ -67,6 +69,8 @@ BUSINESS = [
     (groups_router, "people"),
     (portal_router, None),
     (activity_router, "gatherings"),
+    # Not a paid module: event registration (free) is built on it, so forms can't be a paid add-on.
+    (forms_router, None),
     (finance_router, "giving"),
     (messaging_router, "communications"),
     (notifications_send_router, "communications"),
