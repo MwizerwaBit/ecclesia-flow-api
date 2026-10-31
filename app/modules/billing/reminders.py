@@ -18,10 +18,35 @@ from app.core.database import platform_session
 from app.core.entitlement import to_utc
 from app.core.mailer import OutgoingEmail, send_quietly
 from app.modules.billing import repository
+from app.modules.notifications import service as notifications_service
+from app.modules.rbac import service as rbac_service
 
 logger = logging.getLogger("ecclesia_flow.billing")
 
 CHECK_EVERY_SECONDS = 6 * 60 * 60
+
+
+async def _in_app_copy(tenant_id: str, ends) -> None:
+    """The same reminder in the bell of whoever manages billing. In-app only: the
+    email above already goes to the church's contact address. A failure here is
+    logged and never stops the email or the other churches."""
+    try:
+        async with platform_session() as db:
+            await notifications_service.notify(
+                db,
+                tenant_id,
+                await rbac_service.users_with_permission(db, tenant_id, "billing:manage"),
+                "billing",
+                f"Your plan ends on {ends:%d %B %Y}",
+                "Renew from Billing to keep everything working. After it ends, free basics keep working for "
+                f"{get_settings().billing_grace_days} days, then your church becomes view-only until you pay.",
+                action_url="/staff/settings/billing",
+                resource=("organization", tenant_id),
+                dedupe_key=f"billing.renewal:{tenant_id}:{ends.isoformat()}",
+                email=False,
+            )
+    except Exception:  # noqa: BLE001 — the email and the other churches go on
+        logger.exception("billing.reminder_in_app_failed tenant=%s", tenant_id)
 
 
 async def send_due_reminders() -> int:
@@ -30,9 +55,10 @@ async def send_due_reminders() -> int:
         due = await repository.claim_due_reminders(db, settings.renewal_reminder_days)
     sent = 0
     for row in due:
+        ends = to_utc(row["current_period_end"])
+        await _in_app_copy(str(row["tenant_id"]), ends)
         if not row["contact_email"]:
             continue
-        ends = to_utc(row["current_period_end"])
         await send_quietly(
             OutgoingEmail(
                 to=row["contact_email"],

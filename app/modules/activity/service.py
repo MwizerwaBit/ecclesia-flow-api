@@ -21,6 +21,7 @@ from app.modules.activity.schemas import (
 from app.modules.audit.service import history_for, write_audit
 from app.modules.groups import service as groups_service
 from app.modules.hierarchy import service as hierarchy_service
+from app.modules.notifications import service as notifications_service
 from app.modules.rbac.service import resolve_permissions
 from app.modules.tenant import service as tenant_service
 
@@ -368,6 +369,42 @@ async def update_event(
 # ───────────────────────────── Review workflow ─────────────────────────────
 
 
+async def _tell(
+    db: Prisma,
+    tenant_id: str,
+    event,
+    user_ids: list[str],
+    *,
+    actor_user_id: str,
+    type_: str,
+    title: str,
+    body: str,
+    key: str,
+) -> None:
+    """Tell people about a workflow step on an event. Never the person who did it;
+    `key` makes a repeated step a no-op. Pointers only: the title of the event and
+    who acted, never a reviewer's comment (that stays in the event's history)."""
+    audience = [u for u in dict.fromkeys(user_ids) if u != actor_user_id]
+    if audience:
+        await notifications_service.notify(
+            db,
+            tenant_id,
+            audience,
+            type_,
+            title,
+            body,
+            action_url=f"/staff/events/{event.id}",
+            resource=("event", str(event.id)),
+            dedupe_key=key,
+            actor_user_id=actor_user_id,
+        )
+
+
+async def _author_and_reviewers(db: Prisma, event) -> list[str]:
+    reviewers = [str(r["reviewer_user_id"]) for r in await repository.list_reviews(db, event.id)]
+    return [str(event.created_by_user_id), *reviewers]
+
+
 async def reviewer_options(db: Prisma, exclude_user_id: str) -> list[dict]:
     out = []
     for row in await repository.reviewer_candidates(db):
@@ -396,7 +433,8 @@ async def submit_for_review(
     await repository.clear_reviews(db, event_id)
     for reviewer in reviewers:
         await repository.create_review(db, tenant_id=tenant_id, event_id=event_id, reviewer_user_id=reviewer)
-    await repository.update_event(db, event_id, {"status": "pending_review", "submitted_at": datetime.now(UTC)})
+    submitted_at = datetime.now(UTC)
+    await repository.update_event(db, event_id, {"status": "pending_review", "submitted_at": submitted_at})
     await write_audit(
         db,
         tenant_id=tenant_id,
@@ -405,6 +443,18 @@ async def submit_for_review(
         resource_type="event",
         resource_id=event_id,
         metadata={"reviewers": reviewers},
+    )
+    await _tell(
+        db,
+        tenant_id,
+        event,
+        reviewers,
+        actor_user_id=submitter_user_id,
+        type_="approval",
+        title="Gathering waiting for your review",
+        body=f'{await repository.user_name(db, submitter_user_id)} sent "{event.title}" for your review.',
+        # One per submission: sending it back for changes and resubmitting asks again.
+        key=f"event.review_requested:{event_id}:{submitted_at.isoformat()}",
     )
     return await get_event(db, event_id)
 
@@ -427,6 +477,18 @@ async def decide_review(
     await repository.record_review_decision(db, review.id, {"status": decision, "comment": comment, "decided_at": now})
     if decision == "changes_requested":
         await repository.update_event(db, event_id, {"status": "changes_requested"})
+        await _tell(
+            db,
+            tenant_id,
+            event,
+            [str(event.created_by_user_id)],
+            actor_user_id=reviewer_user_id,
+            type_="event",
+            title="Changes requested on your gathering",
+            body=f'{await repository.user_name(db, reviewer_user_id)} asked for changes to "{event.title}". '
+            "Open it to see what they wrote.",
+            key=f"event.changes_requested:{review.id}",  # a review row is per submission
+        )
     elif await repository.count_reviews_not_approved(db, event_id) == 0:
         await repository.update_event(db, event_id, {"status": "published", "published_at": now})
         await write_audit(
@@ -437,6 +499,19 @@ async def decide_review(
             resource_type="event",
             resource_id=event_id,
             metadata={"via": "review"},
+        )
+        # The last approval is what counts for the author; one reviewer approving
+        # while others are still to decide is not announced.
+        await _tell(
+            db,
+            tenant_id,
+            event,
+            await _author_and_reviewers(db, event),
+            actor_user_id=reviewer_user_id,
+            type_="event",
+            title="Gathering approved and published",
+            body=f'"{event.title}" was approved by its reviewers and is now published.',
+            key=f"event.published:{event_id}",
         )
     await write_audit(
         db,
@@ -466,6 +541,17 @@ async def publish_directly(db: Prisma, tenant_id: str, event_id: str, actor_user
         resource_type="event",
         resource_id=event_id,
     )
+    await _tell(
+        db,
+        tenant_id,
+        event,
+        await _author_and_reviewers(db, event),
+        actor_user_id=actor_user_id,
+        type_="event",
+        title="Gathering published",
+        body=f'{await repository.user_name(db, actor_user_id)} published "{event.title}".',
+        key=f"event.published:{event_id}",
+    )
     return await get_event(db, event_id)
 
 
@@ -483,6 +569,17 @@ async def cancel_event(db: Prisma, tenant_id: str, event_id: str, actor_user_id:
         action="event.canceled",
         resource_type="event",
         resource_id=event_id,
+    )
+    await _tell(
+        db,
+        tenant_id,
+        event,
+        await _author_and_reviewers(db, event),
+        actor_user_id=actor_user_id,
+        type_="event",
+        title="Gathering canceled",
+        body=f'{await repository.user_name(db, actor_user_id)} canceled "{event.title}".',
+        key=f"event.canceled:{event_id}",
     )
     return await get_event(db, event_id)
 
@@ -753,10 +850,14 @@ async def check_collisions(db: Prisma, payload: CollisionCheckInput) -> list[dic
     return out
 
 
-async def notify_key_participants(db: Prisma, tenant_id: str, payload: NotifyKeyParticipantsInput) -> int:
+async def notify_key_participants(
+    db: Prisma, tenant_id: str, actor_user_id: str, payload: NotifyKeyParticipantsInput
+) -> int:
     """Only reaches people who actually have a login — a leader without one
     needs a phone call or a word after service, not a silent no-op, so the
-    count returned is who it actually reached, not who was asked to be."""
+    count returned is who it newly reached, not who was asked to be. Someone
+    already asked about this same clash isn't asked again (the notification
+    service dedupes on the pair of gatherings), so a second click reaches 0."""
     event = await repository.get_event(db, payload.event_id)
     colliding = await repository.get_event(db, payload.colliding_event_id)
     if event is None or colliding is None:
@@ -764,9 +865,9 @@ async def notify_key_participants(db: Prisma, tenant_id: str, payload: NotifyKey
 
     candidates = await repository.key_participants_for(db, group_ids=[event.group_id, colliding.group_id])
     wanted = set(payload.member_ids)
-    # A person leading both colliding groups appears once per group here —
-    # dedupe by user, so they get one notification, not two identical ones.
-    notifiable = list({c["user_id"]: c for c in candidates if c["member_id"] in wanted and c["user_id"]}.values())
+    # A person leading both colliding groups appears once per group here; the
+    # notification service sends each user one notification, not two identical ones.
+    user_ids = [c["user_id"] for c in candidates if c["member_id"] in wanted and c["user_id"]]
 
     event_group = await groups_service.get_group_record(db, event.group_id)
     colliding_group = await groups_service.get_group_record(db, colliding.group_id)
@@ -777,23 +878,20 @@ async def notify_key_participants(db: Prisma, tenant_id: str, payload: NotifyKey
         f'"{colliding.title}" ({when_b}, {colliding_group.name}). Let both group leaders know which one '
         "you'll be at."
     )
-    rows = [
-        {
-            "tenant_id": tenant_id,
-            "user_id": c["user_id"],
-            # "notifications_type_check" only allows pastoral_alert/finance_alert/
-            # system/announcement — a dedicated "schedule_conflict" type would
-            # need its own migration and a notification-preferences entry,
-            # which is more than this warranted; "system" is the closest fit.
-            "type": "system",
-            "title": "Scheduling clash — which will you attend?",
-            "body": body,
-            "action_url": f"/staff/events/{event.id}",
-        }
-        for c in notifiable
-    ]
-    await repository.create_notifications(db, rows)
-    return len(rows)
+    result = await notifications_service.notify(
+        db,
+        tenant_id,
+        user_ids,
+        "event",
+        "Scheduling clash — which will you attend?",
+        body,
+        action_url=f"/staff/events/{event.id}",
+        resource=("event", str(event.id)),
+        # The same clash, whichever of the two gatherings it was raised from.
+        dedupe_key="event.clash:" + ":".join(sorted([str(event.id), str(colliding.id)])),
+        actor_user_id=actor_user_id,
+    )
+    return result.created
 
 
 # ───────────────────────────── Registration forms ─────────────────────────────

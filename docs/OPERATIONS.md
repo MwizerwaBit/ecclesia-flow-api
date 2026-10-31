@@ -132,3 +132,14 @@ Requirements any host setup must meet **[host]**:
 - **Audit checkpoints:** take one daily with
   `scripts/audit_checkpoint.py create`, and store it outside the database
   host, ideally in storage with object lock.
+
+## Notifications: background work
+
+The API starts three loops when `RUN_BACKGROUND_JOBS=true` (the default): plan-renewal reminders (every 6 h),
+notification email delivery (every 30 s) and event reminders (every 60 s). With several API instances they are
+safe to run side by side (rows are claimed with `FOR UPDATE SKIP LOCKED`; reminders dedupe on a unique key). To
+run them from a scheduler instead, set `RUN_BACKGROUND_JOBS=false` and run `python -m scripts.send_notification_emails`
+(every minute) and `python -m scripts.send_event_reminders` (every minute: the hour-before reminder is only as
+punctual as the schedule) and `python -m scripts.send_renewal_reminders`. Email needs `SMTP_HOST` (production
+refuses to start without it); with it empty, mail goes to the dev outbox. A failed email is retried 4 times
+(1 min, 5 min, 30 min, 2 h) and then marked `failed` in `notification_deliveries`.

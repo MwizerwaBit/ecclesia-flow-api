@@ -49,3 +49,16 @@ async def create_custom_role(
 
 async def count_members_with_role(db: Prisma, role_id: str, tenant_id: str) -> int:
     return await db.tenantmembership.count(where={"role_id": role_id, "tenant_id": tenant_id})
+
+
+async def active_role_assignments(db: Prisma, tenant_id: str) -> list[dict]:
+    """(user_id, role_id) for every active team member of a church. The church
+    is named explicitly so it works on a platform session as well."""
+    return await db.query_raw(
+        """
+        select tm.user_id, tm.role_id from tenant_memberships tm
+        join users u on u.id = tm.user_id
+        where tm.tenant_id = $1::uuid and tm.status = 'active' and u.status = 'active'
+        """,
+        tenant_id,
+    )

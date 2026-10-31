@@ -76,6 +76,8 @@ Every error, from every layer, uses one envelope (`app/core/exceptions.py`,
   - response headers: `X-Total-Count`, `X-Page-Limit`, `X-Page-Offset`,
     `Link: <…>; rel="next", <…>; rel="prev"`
   - the body stays a JSON array
+  - a list over a table that grows without bound cuts its page in SQL instead
+    (`@paged_in_sql` + `page_headers`; `/notifications`): same parameters, same headers
 - **Ordering is deterministic.** Every list query's `ORDER BY` must end in a
   unique column, so pages never overlap or skip. Some existing queries
   order by a non-unique column only (a name, or a date) and still need an `id`

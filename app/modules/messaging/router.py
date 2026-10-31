@@ -8,9 +8,6 @@ from app.modules.messaging.schemas import (
     AnnouncementRead,
     AudienceFilter,
     MessageTemplateRead,
-    NotificationPreferencesRead,
-    NotificationPreferencesUpdate,
-    NotificationRead,
 )
 
 router = APIRouter(route_class=PaginatedRoute, tags=["messaging"])
@@ -59,28 +56,3 @@ async def estimate_audience(payload: AudienceFilter, db: TenantDb):
 )
 async def list_templates(db: TenantDb):
     return await service.list_templates(db)
-
-
-@router.get("/notifications", response_model=list[NotificationRead])
-async def list_notifications(claims: CurrentClaims, db: TenantDb):
-    return await service.list_notifications(db, claims.sub)
-
-
-@router.patch("/notifications/{notification_id}", status_code=204)
-async def mark_notification_read(notification_id: str, claims: CurrentClaims, db: TenantDb):
-    await service.mark_notification_read(db, notification_id, claims.sub)
-
-
-@router.post("/notifications/mark-all-read", status_code=204)
-async def mark_all_read(claims: CurrentClaims, db: TenantDb):
-    await service.mark_all_read(db, claims.sub)
-
-
-@router.get("/notification-preferences", response_model=NotificationPreferencesRead)
-async def get_preferences(claims: CurrentClaims, db: TenantDb):
-    return await service.get_preferences(db, claims.sub)
-
-
-@router.put("/notification-preferences", response_model=NotificationPreferencesRead)
-async def update_preferences(payload: NotificationPreferencesUpdate, claims: CurrentClaims, db: TenantDb):
-    return await service.update_preferences(db, claims.sub, payload)

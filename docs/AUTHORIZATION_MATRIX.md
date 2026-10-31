@@ -99,12 +99,19 @@ cannot otherwise see).
 checkbox — see §3) but is enforced the same way: a member reads only their
 own giving record, never another member's, regardless of role.
 
-### Communications — announcements and message templates
+### Communications — announcements, message templates and manual notifications
+
+`notifications:send` sends a short notice to members' bells (and email). It reaches only
+members the sender's unit scope can see (the database's unit-scope policy hides the rest,
+and naming another branch is `403 out_of_scope`), needs an active church and the
+communications module, is limited to 10 sends per sender per hour, and each send is
+audited with its audience and counts but never its text.
 
 | Permission | Sensitive | MFA | Member | Staff | Admin | Leader |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | `announcements:read` | | | ✓ | ✓ | ✓ | ✓ |
 | `announcements:create` | | | | ✓ | ✓ | ✓ |
+| `notifications:send` | ✓ | | | ✓ | ✓ | ✓ |
 
 ### Administration — team, roles and organisation settings
 
@@ -146,7 +153,7 @@ already holds them, which in practice means only the leader.
 | `portal:view` | member, staff, board, leader |
 | `profile:read` | member, staff, board, leader |
 | `profile:update_own` | member, staff, board, leader |
-| `notifications:read` | member, staff, board, leader |
+| `notifications:read` | member, staff, board, leader — gates every `/notifications` and `/notification-preferences` route; they only ever act on the caller's own rows (another user's id is a 404) |
 | `dashboard:view` | staff, board, leader |
 | `certificates:read` | staff, board, leader |
 | `certificates:create` | staff, board, leader |
