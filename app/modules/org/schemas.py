@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, EmailStr, Field, HttpUrl, StringConstraints
+from pydantic import BaseModel, EmailStr, Field, HttpUrl, StringConstraints, field_validator
+
+from app.core.timezones import is_valid
 
 OrgStatus = Literal["pending", "trial", "active", "suspended", "canceled"]
 VerificationStatus = Literal["unverified", "pending_review", "verified", "rejected"]
@@ -47,6 +49,16 @@ class OrgProfileUpdate(BaseModel):
     region: Annotated[str, StringConstraints(strip_whitespace=True, max_length=100)] | None = None
     website: HttpUrl | None = None
     primary_color: Annotated[str, StringConstraints(pattern=r"^#[0-9a-fA-F]{6}$")] | None = None
+    #: The church's IANA time zone (e.g. Africa/Kigali): where its events and repeating
+    #: services are placed on the calendar.
+    timezone: Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)] | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _known_zone(cls, v: str | None) -> str | None:
+        if v is None or not is_valid(v):
+            raise ValueError("Choose a time zone such as Africa/Kigali or America/New_York")
+        return v
 
 
 class ModuleSubscription(BaseModel):
@@ -106,3 +118,15 @@ class InvitePersonInput(BaseModel):
     email: EmailStr
     first_name: Text100
     last_name: Text100 = Field(default="")
+
+
+class SecuritySettings(BaseModel):
+    #: Minutes a leader-side session may sit idle before sign-out (members: always 60).
+    session_idle_minutes: int
+    min_minutes: int
+    max_minutes: int
+    member_minutes: int
+
+
+class SecuritySettingsUpdate(BaseModel):
+    session_idle_minutes: int = Field(ge=5, le=120)

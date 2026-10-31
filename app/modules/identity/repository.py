@@ -55,6 +55,11 @@ async def list_memberships_for_user(db: Prisma, user_id: str) -> list[dict]:
     return rows
 
 
+async def church_idle_minutes(db: Prisma, tenant_id: str) -> int | None:
+    rows = await db.query_raw("select session_idle_minutes from organizations where id = $1::uuid", tenant_id)
+    return rows[0]["session_idle_minutes"] if rows else None
+
+
 async def get_membership(db: Prisma, membership_id: str) -> TenantMembership | None:
     return await db.tenantmembership.find_unique(where={"id": membership_id})
 

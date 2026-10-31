@@ -29,6 +29,14 @@ async def _church(client, church_payload, label: str):
     return payload, session, h, root_id
 
 
+async def _on_plan(session: dict, tier: str = "parish") -> None:
+    """Affiliations belong to the Structure module (Parish plan and up); churches register on Seed."""
+    from app.core.database import platform_session
+
+    async with platform_session() as db:
+        await db.organization.update(where={"id": session["active_membership"]["tenant_id"]}, data={"tier": tier})
+
+
 async def _mfa(client, payload: dict, session: dict) -> dict:
     """Turn on MFA for this leader and return an MFA-verified session."""
     h = auth(session["access_token"])
@@ -384,6 +392,8 @@ async def test_affiliation_lifecycle_and_what_a_parent_can_see(client, church_pa
     p_person = await _member(client, p_plain, "Paula", p_root)
     diocese_id = d_session["active_membership"]["tenant_id"]
     parish_id = p_session["active_membership"]["tenant_id"]
+    await _on_plan(d_session)
+    await _on_plan(p_session)
     d_slug, p_slug = await _slug(client, d_plain), await _slug(client, p_plain)
 
     propose = {"counterpart_slug": d_slug, "counterpart_role": "parent", "grants": ["aggregate_stats"]}
@@ -449,7 +459,8 @@ async def test_affiliation_lifecycle_and_what_a_parent_can_see(client, church_pa
     assert loop.status_code == 409 and loop.json()["error"]["code"] == "cycle"
 
     # An organisation outside the relationship sees nothing of it.
-    _, _, outsider, _ = await _church(client, church_payload, "outsider")
+    _, outsider_session, outsider, _ = await _church(client, church_payload, "outsider")
+    await _on_plan(outsider_session)
     outsider_view = await client.get("/api/v1/affiliations", headers=outsider)
     assert outsider_view.status_code == 200 and outsider_view.json() == []
     assert (await client.get(f"/api/v1/affiliations/{aff['id']}/summary", headers=outsider)).status_code == 404

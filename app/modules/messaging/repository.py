@@ -61,31 +61,3 @@ async def estimate_audience(db: Prisma, *, unit_ids: list[str] | None, statuses:
 
 async def list_templates(db: Prisma) -> list:
     return await db.messagetemplate.find_many(order={"created_at": "desc"})
-
-
-async def list_notifications(db: Prisma, user_id: str) -> list:
-    return await db.notification.find_many(where={"user_id": user_id}, order={"created_at": "desc"}, take=100)
-
-
-async def mark_notification_read(db: Prisma, notification_id: str, user_id: str) -> None:
-    await db.notification.update_many(where={"id": notification_id, "user_id": user_id}, data={"is_read": True})
-
-
-async def mark_all_read(db: Prisma, user_id: str) -> None:
-    await db.notification.update_many(where={"user_id": user_id, "is_read": False}, data={"is_read": True})
-
-
-async def get_preferences(db: Prisma, user_id: str) -> dict | None:
-    row = await db.notificationpreference.find_unique(where={"user_id": user_id})
-    return {"user_id": row.user_id, "preferences": row.preferences} if row else None
-
-
-async def upsert_preferences(db: Prisma, user_id: str, preferences: dict) -> dict:
-    row = await db.notificationpreference.upsert(
-        where={"user_id": user_id},
-        data={
-            "create": {"user_id": user_id, "preferences": Json(preferences)},
-            "update": {"preferences": Json(preferences)},
-        },
-    )
-    return {"user_id": row.user_id, "preferences": row.preferences}

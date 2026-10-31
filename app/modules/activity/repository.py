@@ -1,50 +1,155 @@
+from datetime import datetime
+
 from prisma import Json, Prisma
 from prisma.models import AttendanceRecord, Event
 
 _LIST_COLUMNS = """
     e.id, e.title, e.type, e.start_date_time, e.end_date_time, e.location, e.status, e.is_public,
     e.visibility, e.unit_id, e.group_id, e.cover_image_url, e.theme, e.is_recurring, e.recurrence_rule,
+    e.is_all_day,
     (select count(*) from attendance_records ar where ar.event_id = e.id) as attendee_count,
     (select count(*) from event_reviews r where r.event_id = e.id and r.status = 'pending')::int as pending_reviews
 """
 
+#: What an ordinary member may see: published events that are public or members-only,
+#: plus private (group) events for groups they actively belong to. The one place this
+#: rule lives; every member-facing read goes through it. `{member}` is a $n::uuid
+#: placeholder for the member's id (NULL when the person has no member record).
+_MEMBER_VISIBLE = """e.status = 'published'
+          and (e.visibility in ('public', 'members')
+               or (e.visibility = 'private' and e.group_id in (
+                   select gm.group_id from group_memberships gm
+                   where gm.member_id = {member} and gm.status = 'active')))"""
+
+
+async def member_id_for_user(db: Prisma, user_id: str) -> str | None:
+    rows = await db.query_raw("select id::text as id from members where user_id = $1::uuid limit 1", user_id)
+    return rows[0]["id"] if rows else None
+
+
+async def church_timezone(db: Prisma) -> str | None:
+    """The signed-in (or public-request) church's IANA time zone name."""
+    rows = await db.query_raw("select timezone from organizations where id = current_tenant_id()")
+    return rows[0]["timezone"] if rows else None
+
+
+async def event_visible_to_member(db: Prisma, event_id: str, member_id: str | None) -> bool:
+    rows = await db.query_raw(
+        f"select 1 as ok from events e where e.id = $1::uuid and {_MEMBER_VISIBLE.format(member='$2::uuid')}",
+        event_id,
+        member_id,
+    )
+    return bool(rows)
+
 
 async def list_events(
-    db: Prisma, *, search: str | None, upcoming: bool | None, status: str | None = None
+    db: Prisma,
+    *,
+    search: str | None,
+    upcoming: bool | None,
+    status: str | None = None,
+    restrict_to_member: bool = False,
+    member_id: str | None = None,
 ) -> list[dict]:
+    """`restrict_to_member` limits the list to what that member may see; staff
+    (who manage events) are not restricted beyond their unit scope."""
     clauses = []
     params: list = []
+    if restrict_to_member:
+        params.append(member_id)
+        clauses.append(_MEMBER_VISIBLE.format(member=f"${len(params)}::uuid"))
     if search:
         params.append(f"%{search.lower()}%")
         clauses.append(f"(lower(e.title) like ${len(params)} or lower(coalesce(e.location, '')) like ${len(params)})")
     if upcoming is True:
-        # A repeating event stays "upcoming" while its series continues.
-        clauses.append("(e.start_date_time >= now() or e.recurrence_rule is not null)")
+        # Not finished yet; a repeating series is a candidate until the service sees it has no date left.
+        clauses.append("(coalesce(e.end_date_time, e.start_date_time) >= now() or e.recurrence_rule is not null)")
     elif upcoming is False:
-        clauses.append("e.start_date_time < now() and e.recurrence_rule is null")
+        # Over: a one-off in the past, or a series (the service keeps only the ones that have ended).
+        clauses.append("(coalesce(e.end_date_time, e.start_date_time) < now() or e.recurrence_rule is not null)")
     if status:
         params.append(status)
         clauses.append(f"e.status = ${len(params)}")
     where_sql = (" where " + " and ".join(clauses)) if clauses else ""
     return await db.query_raw(
-        f"select {_LIST_COLUMNS} from events e {where_sql} order by e.start_date_time asc", *params
+        f"select {_LIST_COLUMNS} from events e {where_sql} order by e.start_date_time asc, e.id asc", *params
     )
 
 
 async def list_events_for_member(db: Prisma, member_id: str | None) -> list[dict]:
-    """Published events a member may see: public and members-only ones, plus
-    private (group) events for groups they actively belong to."""
+    """Published events a member may see (see _MEMBER_VISIBLE)."""
     return await db.query_raw(
         f"""
         select {_LIST_COLUMNS} from events e
-        where e.status = 'published'
-          and (e.visibility in ('public', 'members')
-               or (e.visibility = 'private' and e.group_id in (
-                   select gm.group_id from group_memberships gm
-                   where gm.member_id = $1::uuid and gm.status = 'active')))
-        order by e.start_date_time asc
+        where {_MEMBER_VISIBLE.format(member="$1::uuid")}
+        order by e.start_date_time asc, e.id asc
         """,
         member_id,
+    )
+
+
+_WINDOW_COLUMNS = """
+    e.id, e.title, e.type, e.status, e.visibility, e.unit_id, e.group_id, g.name as group_name, e.location,
+    e.start_date_time, e.end_date_time, e.is_all_day, e.is_recurring, e.recurrence_rule,
+    e.theme->>'accent_color' as accent_color
+"""
+
+
+async def list_events_in_window(
+    db: Prisma,
+    *,
+    start: datetime,
+    end: datetime,
+    restrict_to_member: bool,
+    member_id: str | None,
+    type: str | None = None,
+    group_id: str | None = None,
+    unit_id: str | None = None,
+    status: str | None = None,
+) -> list[dict]:
+    """Events that can appear in [start, end]: one-offs overlapping it, and every
+    series that has begun by `end` (the caller expands each into its dates).
+    Canceled events are included so a calendar can show them struck through."""
+    params: list = [start, end]
+    clauses = [
+        "((e.recurrence_rule is null and e.start_date_time < $2::timestamptz"
+        " and ((e.end_date_time is null and e.start_date_time >= $1::timestamptz)"
+        "      or e.end_date_time > $1::timestamptz))"
+        " or (e.recurrence_rule is not null and e.start_date_time < $2::timestamptz))"
+    ]
+    if restrict_to_member:
+        params.append(member_id)
+        clauses.append(_MEMBER_VISIBLE.format(member=f"${len(params)}::uuid"))
+    for column, value in (("type", type), ("group_id", group_id), ("unit_id", unit_id), ("status", status)):
+        if value:
+            params.append(value)
+            cast = "::uuid" if column.endswith("_id") else ""
+            clauses.append(f"e.{column} = ${len(params)}{cast}")
+    return await db.query_raw(
+        f"""
+        select {_WINDOW_COLUMNS} from events e
+        left join groups g on g.id = e.group_id
+        where {" and ".join(clauses)}
+        order by e.start_date_time asc, e.id asc
+        """,
+        *params,
+    )
+
+
+async def list_public_events_in_window(db: Prisma, *, start: datetime, end: datetime) -> list[dict]:
+    return await db.query_raw(
+        f"""
+        select {_WINDOW_COLUMNS} from events e
+        left join groups g on g.id = e.group_id
+        where e.status = 'published' and e.visibility = 'public'
+          and ((e.recurrence_rule is null and e.start_date_time < $2::timestamptz
+                and ((e.end_date_time is null and e.start_date_time >= $1::timestamptz)
+                     or e.end_date_time > $1::timestamptz))
+               or (e.recurrence_rule is not null and e.start_date_time < $2::timestamptz))
+        order by e.start_date_time asc, e.id asc
+        """,
+        start,
+        end,
     )
 
 
@@ -52,10 +157,10 @@ async def list_public_events(db: Prisma) -> list[dict]:
     return await db.query_raw(
         """
         select e.id, e.title, e.type, e.description, e.location, e.online_url, e.start_date_time, e.end_date_time,
-               e.is_recurring, e.recurrence_rule, e.cover_image_url, e.theme
+               e.is_recurring, e.recurrence_rule, e.cover_image_url, e.theme, e.is_all_day
         from events e
         where e.status = 'published' and e.visibility = 'public'
-        order by e.start_date_time asc
+        order by e.start_date_time asc, e.id asc
         """
     )
 
@@ -82,6 +187,11 @@ async def review_queue(db: Prisma, reviewer_user_id: str) -> list[dict]:
         """,
         reviewer_user_id,
     )
+
+
+async def user_name(db: Prisma, user_id: str) -> str:
+    rows = await db.query_raw("select first_name || ' ' || last_name as name from users where id = $1::uuid", user_id)
+    return rows[0]["name"] if rows else "Someone"
 
 
 async def reviewer_candidates(db: Prisma) -> list[dict]:
@@ -116,12 +226,38 @@ async def get_event(db: Prisma, event_id: str) -> Event | None:
     return await db.event.find_unique(where={"id": event_id})
 
 
+async def lock_event(db: Prisma, event_id: str) -> None:
+    """Holds the row for the rest of the request's transaction, so two edits of
+    the same event run one after the other and the stale-edit check is reliable."""
+    await db.query_raw("select 1 from events where id = $1::uuid for update", event_id)
+
+
+async def _set_all_day(db: Prisma, event_id: str, value: bool) -> None:
+    # Written with SQL so this column needs nothing from the generated client's model.
+    # It also stamps updated_at, which an edit that only flips this flag would otherwise leave alone.
+    await db.execute_raw("update events set is_all_day = $2, updated_at = now() where id = $1::uuid", event_id, value)
+
+
 async def create_event(db: Prisma, tenant_id: str, created_by_user_id: str, data: dict) -> Event:
-    return await db.event.create(data={**data, "tenant_id": tenant_id, "created_by_user_id": created_by_user_id})
+    data = dict(data)
+    all_day = data.pop("is_all_day", False)
+    event = await db.event.create(data={**data, "tenant_id": tenant_id, "created_by_user_id": created_by_user_id})
+    if all_day:
+        await _set_all_day(db, event.id, True)
+    return event
 
 
 async def update_event(db: Prisma, event_id: str, data: dict) -> Event:
-    return await db.event.update(where={"id": event_id}, data=data)
+    data = dict(data)
+    all_day = data.pop("is_all_day", None)
+    event = (
+        await db.event.update(where={"id": event_id}, data=data)
+        if data
+        else await db.event.find_unique(where={"id": event_id})
+    )
+    if all_day is not None:
+        await _set_all_day(db, event_id, bool(all_day))
+    return event
 
 
 async def count_expected_members(db: Prisma, unit_id: str | None) -> int:
@@ -288,9 +424,51 @@ async def key_participants_for(db: Prisma, *, group_ids: list[str]) -> list[dict
     )
 
 
-async def create_notifications(db: Prisma, rows: list[dict]) -> None:
-    for row in rows:
-        await db.notification.create(data=row)
+# ── Reminders ───────────────────────────────────────────────────────────
+
+
+async def reminder_candidates(db: Prisma, *, now: datetime, horizon: datetime) -> list[dict]:
+    """Published gatherings that may have an occurrence between `now` and `horizon`,
+    across every church (a platform session). Recurring ones are included whenever
+    they have started, since only their rule says when the next date falls. Churches
+    that are suspended or closed are left out."""
+    return await db.query_raw(
+        """
+        select e.id, e.tenant_id, e.title, e.start_date_time, e.end_date_time, e.is_all_day,
+               e.recurrence_rule, e.group_id, e.visibility, e.created_by_user_id, o.timezone
+        from events e join organizations o on o.id = e.tenant_id
+        where e.status = 'published' and o.status not in ('suspended', 'canceled')
+          and e.start_date_time <= $1::timestamptz
+          and (e.recurrence_rule is not null or e.start_date_time > $2::timestamptz)
+        order by e.start_date_time, e.id
+        """,
+        horizon,
+        now,
+    )
+
+
+async def reminder_recipients(
+    db: Prisma, *, event_id: str, author_user_id: str, group_id: str | None, include_registrants: bool
+) -> list[str]:
+    """Users to remind about one gathering: its author, the active members of its group
+    (leaders included) who have a login, and, for a gathering that isn't private, people
+    who registered with an email that matches an account. Deduplicated; whether each can
+    actually be notified here is the notification service's call."""
+    parts = ["select $2::uuid as user_id"]
+    params: list = [event_id, author_user_id]
+    if group_id:
+        params.append(group_id)
+        parts.append(
+            "select m.user_id from group_memberships gm join members m on m.id = gm.member_id"
+            f" where gm.group_id = ${len(params)}::uuid and gm.status = 'active' and m.user_id is not null"
+        )
+    if include_registrants:
+        parts.append(
+            "select u.id as user_id from event_registrations r join users u on u.email = r.respondent_email"
+            " where r.event_id = $1::uuid and r.respondent_email is not null"
+        )
+    rows = await db.query_raw(" union ".join(parts), *params)
+    return [str(r["user_id"]) for r in rows]
 
 
 # ── Registration forms ──────────────────────────────────────────────────
@@ -325,7 +503,7 @@ async def get_public_event_row(db: Prisma, event_id: str) -> dict | None:
     rows = await db.query_raw(
         """
         select e.id, e.title, e.type, e.description, e.location, e.online_url, e.start_date_time, e.end_date_time,
-               e.is_recurring, e.recurrence_rule, e.cover_image_url, e.theme
+               e.is_recurring, e.recurrence_rule, e.cover_image_url, e.theme, e.is_all_day
         from events e
         where e.id = $1::uuid and e.status = 'published' and e.visibility = 'public'
         """,

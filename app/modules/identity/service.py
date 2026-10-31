@@ -26,6 +26,7 @@ from app.core.security import (
     verify_password,
     verify_totp,
 )
+from app.core.session_policy import idle_minutes
 from app.modules.audit.service import write_audit
 from app.modules.identity import repository
 from app.modules.identity.schemas import (
@@ -37,7 +38,12 @@ from app.modules.identity.schemas import (
     StepUpResponse,
     UserPublic,
 )
-from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID, SYSTEM_ROLE_NAMES
+from app.modules.rbac.models import (
+    SYSTEM_ROLE_BOARD_ID,
+    SYSTEM_ROLE_LEADER_ID,
+    SYSTEM_ROLE_MEMBER_ID,
+    SYSTEM_ROLE_NAMES,
+)
 from app.modules.rbac.service import resolve_permissions
 from app.modules.tenant import service as tenant_service
 from app.modules.tenant.service import create_organization_with_root_unit
@@ -87,10 +93,12 @@ async def _issue_tokens_for_membership(
     whole family, not just the newest link."""
     permissions: list[str] = []
     role_id: str | None = None
+    church_minutes: int | None = None
     if membership_summary is not None:
         membership = await repository.get_membership(db, str(membership_summary.id))
         role_id = membership.role_id
         permissions = await resolve_permissions(db, role_id)
+        church_minutes = await repository.church_idle_minutes(db, str(membership_summary.tenant_id))
 
     access_token = create_access_token(
         user_id=user.id,
@@ -130,6 +138,11 @@ async def _issue_tokens_for_membership(
             permissions=permissions,
             role=SYSTEM_ROLE_NAMES.get(role_id) if role_id else None,
             unit_scope_id=membership_summary.unit_scope_id if membership_summary else None,
+            idle_timeout_minutes=idle_minutes(
+                is_platform_admin=user.is_platform_admin and membership_summary is None,
+                is_member_role=role_id == SYSTEM_ROLE_MEMBER_ID,
+                church_minutes=church_minutes,
+            ),
         ),
         new_token_row,
     )
@@ -713,6 +726,15 @@ async def accept_invite(
 
 
 async def start_mfa_setup(db: Prisma, user: User) -> MfaSetupResponse:
+    # Setting up writes a new secret and leaves two-step sign-in off until it is
+    # confirmed, so on an account that already has it that would silently switch it
+    # off for anyone holding a session. Changing the device means turning it off
+    # first, which needs a current code (require_step_up on /mfa/disable).
+    if user.mfa_enabled:
+        raise ConflictError(
+            "Two-step sign-in is already on. Turn it off first (this asks for a code) to set it up again.",
+            code="mfa_already_enabled",
+        )
     secret = generate_totp_secret()
     backup_codes = generate_backup_codes()
     await repository.set_mfa(

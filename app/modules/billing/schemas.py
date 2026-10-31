@@ -97,6 +97,11 @@ class AccessRead(BaseModel):
     payment_pending: bool = False
 
 
+class PriceOption(BaseModel):
+    currency: str
+    amount_cents: int
+
+
 class PaymentInstructions(BaseModel):
     """Where to send the money, and how much, for the plan and months chosen."""
 
@@ -108,6 +113,8 @@ class PaymentInstructions(BaseModel):
     months: int
     amount_cents: int
     currency: str
+    #: The price in every currency this church may pay in (the first is the default).
+    options: list[PriceOption]
 
 
 ManualStatus = Literal["pending", "approved", "rejected"]

@@ -52,9 +52,11 @@ async def create_checkout(request: Request, payload: CheckoutInput, claims: Curr
 
 
 @router.get("/manual/instructions", response_model=PaymentInstructions, dependencies=MANAGE)
-async def manual_instructions(tier: str, months: Annotated[int, Query(ge=1, le=manual.MAX_MONTHS)]):
+async def manual_instructions(
+    tier: str, months: Annotated[int, Query(ge=1, le=manual.MAX_MONTHS)], currency: str | None = None
+):
     """Where to send the money, and how much, for the plan and months chosen."""
-    return manual.instructions(tier, months)
+    return manual.instructions(tier, months, currency)
 
 
 @router.get("/manual/payments", response_model=list[ManualPaymentRead], dependencies=MANAGE)
@@ -74,6 +76,7 @@ async def submit_manual_payment(
     sent_amount_cents: Annotated[int, Form(gt=0)],
     proof: Annotated[UploadFile, File()],
     momo_transaction_id: Annotated[str | None, Form()] = None,
+    currency: Annotated[str | None, Form()] = None,
 ):
     return await manual.submit(
         db,
@@ -85,6 +88,7 @@ async def submit_manual_payment(
         sent_amount_cents=sent_amount_cents,
         momo_transaction_id=momo_transaction_id,
         proof=await proof.read(),
+        currency=currency,
     )
 
 

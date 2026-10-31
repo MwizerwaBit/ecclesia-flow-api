@@ -25,8 +25,10 @@ from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.core.mailer import OutgoingEmail, send_quietly
 from app.modules.audit.service import write_audit
 from app.modules.billing import repository
+from app.modules.notifications import service as notifications_service
 from app.modules.org import lifecycle
 from app.modules.org.catalogue import PLAN_BY_TIER, PURCHASABLE_TIERS
+from app.modules.rbac import service as rbac_service
 
 MAX_MONTHS = 36
 
@@ -47,9 +49,31 @@ def price_for(tier: str, months: int) -> tuple[str, int]:
     return plan.name, amount
 
 
-def instructions(tier: str, months: int) -> dict:
+def price_options(base_amount: int) -> dict[str, int]:
+    """What the price is in each currency a church may pay in, in cents.
+
+    The catalogue is in `billing_currency`. The other of USD / RWF is offered
+    only when the operator set `rwf_per_usd`, and is rounded up to a whole
+    franc (or a whole cent) so a church is never asked for less than the price."""
     settings = get_settings()
-    plan_name, amount = price_for(tier, months)
+    base = settings.billing_currency.lower()
+    options = {base: base_amount}
+    rate = settings.rwf_per_usd
+    if rate > 0 and base == "usd":
+        options["rwf"] = -(-base_amount * rate // 100) * 100  # ceil(usd_cents/100*rate) francs
+    elif rate > 0 and base == "rwf":
+        options["usd"] = -(-base_amount // rate)  # ceil(francs/rate*100) cents
+    return options
+
+
+def instructions(tier: str, months: int, currency: str | None = None) -> dict:
+    settings = get_settings()
+    plan_name, base_amount = price_for(tier, months)
+    options = price_options(base_amount)
+    currency = (currency or settings.billing_currency).lower()
+    if currency not in options:
+        raise BadPaymentError(f"Payment in {currency.upper()} isn't available")
+    amount = options[currency]
     return {
         "network": settings.momo_network,
         "number": settings.momo_number,
@@ -58,7 +82,8 @@ def instructions(tier: str, months: int) -> dict:
         "plan_name": plan_name,
         "months": months,
         "amount_cents": amount,
-        "currency": settings.billing_currency,
+        "currency": currency,
+        "options": [{"currency": c, "amount_cents": a} for c, a in options.items()],
     }
 
 
@@ -97,13 +122,15 @@ async def submit(
     sent_amount_cents: int,
     momo_transaction_id: str | None,
     proof: bytes,
+    currency: str | None = None,
 ) -> dict:
     sender_name = sender_name.strip()
     if len(sender_name) < 2 or len(sender_name) > 120:
         raise BadPaymentError("Enter the name the money was sent from")
     if sent_amount_cents <= 0:
         raise BadPaymentError("Enter the amount you sent")
-    _, expected = price_for(tier, months)
+    chosen = instructions(tier, months, currency)  # also refuses a currency that isn't offered
+    expected, currency = chosen["amount_cents"], chosen["currency"]
 
     status = await repository.org_status(db, org_id)
     if status is None or status in ("canceled", "suspended"):
@@ -123,7 +150,7 @@ async def submit(
             "tier": tier,
             "months": months,
             "amount_cents": expected,
-            "currency": get_settings().billing_currency,
+            "currency": currency,
             "reference_code": _reference(),
             "sender_name": sender_name,
             "sent_amount_cents": sent_amount_cents,
@@ -218,6 +245,33 @@ async def read_proof(db: Prisma, admin_id: str, payment_id: str) -> tuple[bytes,
     return data, row["proof_mime_type"]
 
 
+BILLING_URL = "/staff/settings/billing"
+
+
+def months_text(months: int) -> str:
+    return f"{months} month" + ("" if months == 1 else "s")
+
+
+async def _tell_church(db: Prisma, tenant_id: str, payment: dict, *, title: str, body: str, key: str) -> None:
+    """The in-app notice of a decision, for whoever can manage the church's billing
+    and for whoever submitted the payment. The email the church already gets goes
+    to its contact address, so this is in-app only (no second email). A pointer, not
+    the platform admin's note: the reason stays in Billing, behind the permission."""
+    admins = await rbac_service.users_with_permission(db, tenant_id, "billing:manage")
+    await notifications_service.notify(
+        db,
+        tenant_id,
+        [*admins, str(payment["submitted_by_user_id"])],
+        "billing",
+        title,
+        body,
+        action_url=BILLING_URL,
+        resource=("billing_manual_payment", str(payment["id"])),
+        dedupe_key=key,
+        email=False,
+    )
+
+
 async def approve(db: Prisma, admin_id: str, payment_id: str, *, note: str, accept_amount_difference: bool) -> dict:
     payment = await _lock(db, payment_id)  # row lock: two admins can't both approve
     if payment["status"] != "pending":
@@ -285,6 +339,15 @@ async def approve(db: Prisma, admin_id: str, payment_id: str, *, note: str, acce
             "amount_difference_accepted": accept_amount_difference and differs,
         },
     )
+    await _tell_church(
+        db,
+        tenant_id,
+        payment,
+        title="Payment approved",
+        body=f"{months_text(payment['months'])} of the {PLAN_BY_TIER[payment['tier']].name} plan were added. "
+        f"Your plan now runs until {until:%d %B %Y}.",
+        key=f"billing.payment_approved:{payment_id}",
+    )
     if org and org["contact_email"]:
         await send_quietly(
             OutgoingEmail(
@@ -313,6 +376,14 @@ async def reject(db: Prisma, admin_id: str, payment_id: str, *, reason: str) -> 
         resource_type="billing_manual_payment",
         resource_id=payment_id,
         metadata={"reason": reason},
+    )
+    await _tell_church(
+        db,
+        tenant_id,
+        payment,
+        title="Payment could not be approved",
+        body="We couldn't approve the payment you sent. Open Billing to see why and send it again.",
+        key=f"billing.payment_rejected:{payment_id}",
     )
     org = await repository.org_contact(db, tenant_id)
     if org and org["contact_email"]:

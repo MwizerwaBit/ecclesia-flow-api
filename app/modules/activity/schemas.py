@@ -18,6 +18,12 @@ class EventTheme(BaseModel):
     layout: Literal["classic", "banner", "minimal"] = "classic"
 
 
+def _same_kind(start: datetime | None, end: datetime | None) -> None:
+    """Both times carry a UTC offset or neither does: a mix can't be compared or placed."""
+    if start is not None and end is not None and (start.tzinfo is None) != (end.tzinfo is None):
+        raise ValueError("Give the start and end both with or both without a time zone offset")
+
+
 def _cover(value: str | None) -> str | None:
     # Covers come from our own media store (relative /media-files/… URL) or an
     # https image URL — never javascript:, data: or plain http.
@@ -47,6 +53,7 @@ class EventListItem(BaseModel):
     recurrence_rule: str | None = None
     next_occurrence: datetime | None = None
     pending_reviews: int = 0
+    is_all_day: bool = False
 
 
 class EventReviewRead(BaseModel):
@@ -71,6 +78,9 @@ class ChurchEventRead(BaseModel):
     status: str
     unit_id: str | None
     unit_name: str | None
+    is_all_day: bool = False
+    #: The next date that has not finished (None for a one-off in the past or an ended series).
+    next_occurrence: datetime | None = None
     attendance_mode: str
     is_public: bool
     visibility: Visibility = "members"
@@ -109,6 +119,7 @@ class ChurchEventCreate(_EventFields):
     start_date_time: datetime
     end_date_time: datetime | None = None
     recurrence_rule: str | None = None
+    is_all_day: bool = False
     unit_id: str | None = None
     attendance_mode: Literal["individual", "headcount"] = "individual"
     visibility: Visibility = "members"
@@ -120,6 +131,7 @@ class ChurchEventCreate(_EventFields):
 
     @model_validator(mode="after")
     def _consistent(self) -> "ChurchEventCreate":
+        _same_kind(self.start_date_time, self.end_date_time)
         if self.end_date_time and self.end_date_time <= self.start_date_time:
             raise ValueError("The event must end after it starts")
         if self.visibility == "private" and not self.group_id:
@@ -143,6 +155,20 @@ class ChurchEventUpdate(_EventFields):
     theme: EventTheme | None = None
     online_url: HttpUrl | None = None
     capacity: Annotated[int, Field(gt=0, le=100000)] | None = None
+    is_all_day: bool | None = None
+    #: The `updated_at` the editor was looking at. If someone saved since, the
+    #: edit is refused (409 edit_conflict) instead of silently overwriting them.
+    expected_updated_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _no_clearing_required_fields(self) -> "ChurchEventUpdate":
+        for name in ("title", "type", "start_date_time", "is_all_day", "visibility", "attendance_mode"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError(f"{name} can't be cleared")
+        _same_kind(self.start_date_time, self.end_date_time)
+        if self.start_date_time and self.end_date_time and self.end_date_time <= self.start_date_time:
+            raise ValueError("The event must end after it starts")
+        return self
 
 
 class SubmitForReviewInput(BaseModel):
@@ -202,6 +228,7 @@ class HeadcountEntry(BaseModel):
 
 class PublicEvent(BaseModel):
     id: str
+    is_all_day: bool = False
     title: str
     type: str
     description: str | None
@@ -211,6 +238,8 @@ class PublicEvent(BaseModel):
     end_date_time: datetime | None
     next_occurrence: datetime | None
     is_recurring: bool
+    #: How it repeats (an RRULE), so the public page can say "Every Sunday".
+    recurrence_rule: str | None = None
     cover_image_url: str | None
     theme: EventTheme
 
@@ -310,3 +339,64 @@ class EventRegistrationRead(BaseModel):
     respondent_phone: str | None
     answers: dict[str, str | list[str]]
     created_at: datetime
+
+
+# ───────────────────────────── Calendar window ─────────────────────────────
+
+
+class CalendarOccurrence(BaseModel):
+    """One dated appearance of an event. `occurrence_start` (with `event_id`)
+    identifies it; times are UTC instants, shown in the church's time zone."""
+
+    event_id: str
+    title: str
+    type: str
+    status: str
+    visibility: Visibility
+    unit_id: str | None
+    group_id: str | None
+    group_name: str | None
+    location: str | None
+    occurrence_start: datetime
+    occurrence_end: datetime | None
+    is_all_day: bool
+    is_recurring: bool
+    accent_color: str | None = None
+
+
+class CalendarWindow(BaseModel):
+    #: The church's IANA zone (UTC if none is set): how to place events on a day.
+    timezone: str
+    window_start: datetime
+    window_end: datetime
+    #: True when more occurrences exist than were returned; narrow the window or filters.
+    truncated: bool
+    occurrences: list[CalendarOccurrence]
+
+
+class PublicCalendarOccurrence(BaseModel):
+    event_id: str
+    title: str
+    type: str
+    location: str | None
+    occurrence_start: datetime
+    occurrence_end: datetime | None
+    is_all_day: bool
+    is_recurring: bool
+    accent_color: str | None = None
+
+
+class PublicCalendarWindow(BaseModel):
+    timezone: str
+    window_start: datetime
+    window_end: datetime
+    truncated: bool
+    occurrences: list[PublicCalendarOccurrence]
+
+
+class EventHistoryEntry(BaseModel):
+    id: str
+    action: str
+    actor_name: str | None
+    created_at: datetime
+    metadata: dict | None = None

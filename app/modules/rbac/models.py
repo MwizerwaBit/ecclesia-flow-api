@@ -45,6 +45,7 @@ SYSTEM_ROLE_PERMISSIONS: dict[str, list[str]] = {
         "finance:update",
         "announcements:read",
         "announcements:create",
+        "notifications:send",
         "certificates:read",
         "certificates:create",
         "dashboard:view",
@@ -73,6 +74,7 @@ SYSTEM_ROLE_PERMISSIONS: dict[str, list[str]] = {
         "finance:export",
         "announcements:read",
         "announcements:create",
+        "notifications:send",
         "certificates:read",
         "certificates:create",
         "dashboard:view",
@@ -178,6 +180,7 @@ PERMISSION_CATALOGUE: list[dict] = [
         "permissions": [
             {"key": "announcements:read", "label": "View announcements"},
             {"key": "announcements:create", "label": "Publish announcements"},
+            {"key": "notifications:send", "label": "Send a notification to members", "sensitive": True},
         ],
     },
     {
