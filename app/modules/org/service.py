@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from prisma import Prisma
 
-from app.core import private_storage
+from app.core import private_storage, session_policy
 from app.core.authz import Scope
 from app.core.entitlement import load_access
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
@@ -60,6 +60,35 @@ async def update_profile(db: Prisma, org_id: str, actor_user_id: str, payload: O
         metadata={"fields": sorted(data)},
     )
     return org
+
+
+# ───────────────────────────── Security ─────────────────────────────
+
+
+async def get_security(db: Prisma, org_id: str) -> dict:
+    return {
+        "session_idle_minutes": await repository.get_session_idle_minutes(db, org_id),
+        "min_minutes": session_policy.MIN_IDLE_MINUTES,
+        "max_minutes": session_policy.MAX_IDLE_MINUTES,
+        "member_minutes": session_policy.MEMBER_IDLE_MINUTES,
+    }
+
+
+async def set_security(db: Prisma, org_id: str, minutes: int, *, actor_user_id: str) -> dict:
+    """Takes effect for a person's next sign-in or session refresh (within the
+    access-token lifetime), because that is when the app learns the new limit."""
+    before = await repository.get_session_idle_minutes(db, org_id)
+    await repository.set_session_idle_minutes(db, org_id, minutes)
+    await write_audit(
+        db,
+        tenant_id=org_id,
+        actor_user_id=actor_user_id,
+        action="org.session_idle_set",
+        resource_type="organization",
+        resource_id=org_id,
+        metadata={"from": before, "to": minutes},
+    )
+    return await get_security(db, org_id)
 
 
 # ───────────────────────────── Modules ─────────────────────────────

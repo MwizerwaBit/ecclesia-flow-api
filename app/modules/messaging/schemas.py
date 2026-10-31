@@ -50,23 +50,3 @@ class MessageTemplateRead(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
-
-
-class NotificationRead(BaseModel):
-    id: str
-    user_id: str
-    type: str
-    title: str
-    body: str
-    is_read: bool
-    action_url: str | None
-    created_at: datetime
-
-
-class NotificationPreferencesRead(BaseModel):
-    user_id: str
-    preferences: dict
-
-
-class NotificationPreferencesUpdate(BaseModel):
-    preferences: dict

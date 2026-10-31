@@ -243,3 +243,56 @@ async def test_renewal_reminder_goes_out_once_in_the_last_week(client, church_pa
     assert await send_due_reminders() == 0  # already told about this end date
     overview = (await client.get(f"{BASE}/billing/overview", headers=auth(session["access_token"]))).json()
     assert overview["access"]["renewal_due"] is True
+
+
+def test_price_options_follow_the_rate(monkeypatch):
+    from app.modules.billing import manual
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "billing_currency", "usd")
+    monkeypatch.setattr(settings, "rwf_per_usd", 0)
+    assert manual.price_options(4900) == {"usd": 4900}  # no rate: USD only
+
+    monkeypatch.setattr(settings, "rwf_per_usd", 1450)
+    assert manual.price_options(4900) == {"usd": 4900, "rwf": 71050 * 100}
+    assert manual.price_options(1999)["rwf"] == 28986 * 100  # 28985.5 francs rounds up, never down
+
+
+async def test_church_can_pay_in_francs_when_a_rate_is_set(client, church_payload, monkeypatch):
+    monkeypatch.setattr(get_settings(), "billing_currency", "usd")
+    monkeypatch.setattr(get_settings(), "rwf_per_usd", 1450)
+    session = await church(client, church_payload, "rwf")
+    h = auth(session["access_token"])
+
+    info = (await client.get(f"{BASE}/billing/manual/instructions?tier=seed&months=1", headers=h)).json()
+    assert info["currency"] == "usd" and {o["currency"] for o in info["options"]} == {"usd", "rwf"}
+    in_rwf = (await client.get(f"{BASE}/billing/manual/instructions?tier=seed&months=1&currency=rwf", headers=h)).json()
+    assert in_rwf["currency"] == "rwf" and in_rwf["amount_cents"] == 27550 * 100  # 19 USD x 1450
+
+    refused = await client.get(f"{BASE}/billing/manual/instructions?tier=seed&months=1&currency=eur", headers=h)
+    assert refused.status_code == 422
+
+    sent = await client.post(
+        f"{BASE}/billing/manual/payments",
+        data={
+            "tier": "seed",
+            "months": "1",
+            "currency": "rwf",
+            "sender_name": "Jean Mukiza",
+            "sent_amount_cents": str(27550 * 100),
+        },
+        files={"proof": ("proof.png", png(), "image/png")},
+        headers=h,
+    )
+    assert sent.status_code == 201, sent.text
+    assert sent.json()["currency"] == "rwf" and sent.json()["amount_cents"] == 27550 * 100
+
+
+async def test_francs_are_refused_without_a_rate(client, church_payload, monkeypatch):
+    monkeypatch.setattr(get_settings(), "billing_currency", "usd")
+    monkeypatch.setattr(get_settings(), "rwf_per_usd", 0)
+    session = await church(client, church_payload, "norate")
+    resp = await client.get(
+        f"{BASE}/billing/manual/instructions?tier=seed&months=1&currency=rwf", headers=auth(session["access_token"])
+    )
+    assert resp.status_code == 422

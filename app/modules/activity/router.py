@@ -1,9 +1,16 @@
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from app.core.authz import CurrentScope, ensure_event_readable, ensure_event_writable, ensure_member_visible
-from app.core.deps import CurrentClaims, PreTenantDb, TenantDb, require_permission
+from app.core.authz import (
+    CurrentScope,
+    Scope,
+    ensure_event_readable,
+    ensure_event_writable,
+    ensure_member_visible,
+)
+from app.core.deps import CurrentClaims, PreTenantDb, TenantDb, require_any_permission, require_permission
 from app.core.pagination import PaginatedRoute
 from app.core.rate_limit import limiter
 from app.modules.activity import service
@@ -11,16 +18,21 @@ from app.modules.activity.schemas import (
     AttendanceMarkInput,
     AttendanceRecordRead,
     AttendanceSummary,
+    CalendarWindow,
     ChurchEventCreate,
     ChurchEventRead,
     ChurchEventUpdate,
     CollisionCheckInput,
     EventCollision,
+    EventHistoryEntry,
     EventListItem,
     EventRegistrationInput,
     EventRegistrationRead,
+    EventStatus,
+    EventType,
     HeadcountEntry,
     NotifyKeyParticipantsInput,
+    PublicCalendarWindow,
     PublicEvent,
     PublicEventDetail,
     RegistrationFieldRead,
@@ -33,16 +45,57 @@ from app.modules.activity.schemas import (
 router = APIRouter(route_class=PaginatedRoute, prefix="/events", tags=["activity"])
 
 
+async def _viewer(db, scope: Scope, claims) -> service.Viewer:
+    """People who can create, edit or review events run them and see everything
+    in their unit scope. Everyone else (an ordinary member) sees only published
+    events a member may see: no drafts, reviews or other groups' private events.
+    A permission alone ("events:read") never widens that."""
+    can_manage = any(scope.has(p) for p in service.MANAGE_PERMISSIONS)
+    return await service.viewer_for(db, can_manage=can_manage, user_id=claims.sub)
+
+
 @router.get("", response_model=list[EventListItem], dependencies=[Depends(require_permission("events:read"))])
 async def list_events(
     db: TenantDb,
     scope: CurrentScope,
+    claims: CurrentClaims,
     search: str | None = Query(default=None),
     upcoming: bool | None = Query(default=None),
     status: str | None = Query(default=None),
 ):
     # Church-wide gatherings are visible to everyone; branch events only in scope.
-    return scope.filter_shared(await service.list_events(db, search=search, upcoming=upcoming, status=status))
+    viewer = await _viewer(db, scope, claims)
+    return scope.filter_shared(await service.list_events(db, viewer, search=search, upcoming=upcoming, status=status))
+
+
+@router.get("/calendar", response_model=CalendarWindow, dependencies=[Depends(require_permission("events:read"))])
+async def calendar(
+    db: TenantDb,
+    scope: CurrentScope,
+    claims: CurrentClaims,
+    start: datetime = Query(alias="from"),
+    end: datetime = Query(alias="to"),
+    type: EventType | None = Query(default=None),
+    group_id: uuid.UUID | None = Query(default=None),
+    unit_id: uuid.UUID | None = Query(default=None),
+    status: EventStatus | None = Query(default=None),
+):
+    """Dated appearances of events between `from` and `to` (at most 93 days),
+    repeating events already expanded in the church's time zone. A time without
+    an offset is read as the church's local time. Staff see every status in
+    their scope; members see only what a member may."""
+    viewer = await _viewer(db, scope, claims)
+    return await service.calendar(
+        db,
+        viewer,
+        start=start,
+        end=end,
+        type=type,
+        group_id=str(group_id) if group_id else None,
+        unit_id=str(unit_id) if unit_id else None,
+        status=status,
+        in_scope=scope.shared_readable,
+    )
 
 
 # Static paths before /{event_id}.
@@ -75,15 +128,27 @@ async def check_collisions(payload: CollisionCheckInput, db: TenantDb):
 @router.post("/notify-conflict", response_model=int, dependencies=[Depends(require_permission("events:create"))])
 async def notify_conflict(payload: NotifyKeyParticipantsInput, claims: CurrentClaims, db: TenantDb):
     """Asks each named leader which of the two clashing gatherings they'll
-    be at. Returns how many were actually reached (some leaders have no
-    portal login yet)."""
-    return await service.notify_key_participants(db, claims.tenant_id, payload)
+    be at. Returns how many were newly reached (some leaders have no portal
+    login yet; someone already asked about this clash isn't asked twice)."""
+    return await service.notify_key_participants(db, claims.tenant_id, claims.sub, payload)
 
 
 @router.get("/{event_id}", response_model=ChurchEventRead, dependencies=[Depends(require_permission("events:read"))])
-async def get_event(event_id: str, db: TenantDb, scope: CurrentScope):
+async def get_event(event_id: str, db: TenantDb, scope: CurrentScope, claims: CurrentClaims):
     await ensure_event_readable(db, scope, event_id)
-    return await service.get_event(db, event_id)
+    return await service.get_event(db, event_id, await _viewer(db, scope, claims))
+
+
+@router.get(
+    "/{event_id}/history",
+    response_model=list[EventHistoryEntry],
+    dependencies=[Depends(require_any_permission("events:update", "events:review"))],
+)
+async def event_history(event_id: str, db: TenantDb, scope: CurrentScope):
+    """Who created, changed, submitted, approved, published or canceled this
+    gathering, and what changed."""
+    await ensure_event_readable(db, scope, event_id)
+    return await service.event_history(db, event_id)
 
 
 @router.post("", response_model=ChurchEventRead, dependencies=[Depends(require_permission("events:create"))])
@@ -95,11 +160,13 @@ async def create_event(payload: ChurchEventCreate, claims: CurrentClaims, scope:
 @router.patch(
     "/{event_id}", response_model=ChurchEventRead, dependencies=[Depends(require_permission("events:update"))]
 )
-async def update_event(event_id: str, payload: ChurchEventUpdate, scope: CurrentScope, db: TenantDb):
+async def update_event(
+    event_id: str, payload: ChurchEventUpdate, claims: CurrentClaims, scope: CurrentScope, db: TenantDb
+):
     await ensure_event_writable(db, scope, event_id)
     if "unit_id" in payload.model_fields_set:
         payload.unit_id = scope.assignable_unit(payload.unit_id)
-    return await service.update_event(db, event_id, payload)
+    return await service.update_event(db, claims.tenant_id, claims.sub, event_id, payload)
 
 
 @router.get(
@@ -194,12 +261,13 @@ async def cancel(event_id: str, claims: CurrentClaims, scope: CurrentScope, db: 
 async def list_occurrences(
     event_id: str,
     scope: CurrentScope,
+    claims: CurrentClaims,
     db: TenantDb,
     start: datetime = Query(alias="from"),
     end: datetime = Query(alias="to"),
 ):
     await ensure_event_readable(db, scope, event_id)
-    return await service.occurrences(db, event_id, start, end)
+    return await service.occurrences(db, event_id, start, end, await _viewer(db, scope, claims))
 
 
 # ───────────────────────────── Registration forms ─────────────────────────────
@@ -210,9 +278,9 @@ async def list_occurrences(
     response_model=list[RegistrationFieldRead],
     dependencies=[Depends(require_permission("events:read"))],
 )
-async def get_registration_fields(event_id: str, db: TenantDb, scope: CurrentScope):
+async def get_registration_fields(event_id: str, db: TenantDb, scope: CurrentScope, claims: CurrentClaims):
     await ensure_event_readable(db, scope, event_id)
-    return await service.get_registration_fields(db, event_id)
+    return await service.get_registration_fields(db, event_id, await _viewer(db, scope, claims))
 
 
 @router.put(
@@ -250,6 +318,18 @@ public_router = APIRouter(route_class=PaginatedRoute, prefix="/churches", tags=[
 async def public_events(slug: str, db: PreTenantDb):
     """A live church's published, public gatherings — nothing else."""
     return await service.public_events_for_church(db, slug)
+
+
+@public_router.get("/{slug}/calendar", response_model=PublicCalendarWindow)
+async def public_calendar(
+    slug: str,
+    db: PreTenantDb,
+    start: datetime = Query(alias="from"),
+    end: datetime = Query(alias="to"),
+):
+    """Published public gatherings between `from` and `to` (at most 93 days),
+    repeating ones expanded in the church's time zone."""
+    return await service.public_calendar(db, slug, start=start, end=end)
 
 
 @public_router.get("/{slug}/events/{event_id}", response_model=PublicEventDetail)

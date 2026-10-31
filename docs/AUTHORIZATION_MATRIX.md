@@ -66,6 +66,25 @@ permission by default (`SYSTEM_ROLE_PERMISSIONS`).
 | `events:update` | | | | ✓ | ✓ | ✓ |
 | `events:review` | | | | | ✓ | ✓ |
 
+**What `events:read` alone shows.** The permission is necessary, not sufficient. A person who holds
+only `events:read` (the Member role) sees just what a member may see: **published** events that are
+public or members-only, plus private events of groups they are an *active* member of (an unaccepted
+invitation does not count). Drafts, events waiting for review, canceled events, other groups' private
+events, review comments, registration questions and history are answered with the same 404 as an event
+that does not exist. This rule is applied on every event read route (`GET /events`, `/events/calendar`,
+`/events/{id}`, `/events/{id}/occurrences`, `/events/{id}/fields`) from one place
+(`activity.repository._MEMBER_VISIBLE`, `activity.service.Viewer`).
+
+People who can **create, update or review** events ("managers") are not limited by status or visibility:
+they see every event inside their unit scope, drafts included. `GET /events/{id}/history` (who changed
+what) needs `events:update` or `events:review`. Editing a published event is allowed for anyone with
+`events:update` in scope and is recorded in the audit log with before/after values; a second reviewer is
+not required (roles without `events:review` still cannot publish). The public calendar
+(`GET /churches/{slug}/calendar`) shows only published, public events and carries no status, group or
+unit. Attendance routes still follow `attendance:read` / `attendance:create` plus unit scope, not the
+member visibility rule (known gap: an attendance-only role can read the attendance of an event it
+cannot otherwise see).
+
 ### Giving — offerings, funds and pledges
 
 | Permission | Sensitive | MFA | Member | Staff | Admin | Leader |
@@ -80,12 +99,19 @@ permission by default (`SYSTEM_ROLE_PERMISSIONS`).
 checkbox — see §3) but is enforced the same way: a member reads only their
 own giving record, never another member's, regardless of role.
 
-### Communications — announcements and message templates
+### Communications — announcements, message templates and manual notifications
+
+`notifications:send` sends a short notice to members' bells (and email). It reaches only
+members the sender's unit scope can see (the database's unit-scope policy hides the rest,
+and naming another branch is `403 out_of_scope`), needs an active church and the
+communications module, is limited to 10 sends per sender per hour, and each send is
+audited with its audience and counts but never its text.
 
 | Permission | Sensitive | MFA | Member | Staff | Admin | Leader |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | `announcements:read` | | | ✓ | ✓ | ✓ | ✓ |
 | `announcements:create` | | | | ✓ | ✓ | ✓ |
+| `notifications:send` | ✓ | | | ✓ | ✓ | ✓ |
 
 ### Administration — team, roles and organisation settings
 
@@ -127,7 +153,7 @@ already holds them, which in practice means only the leader.
 | `portal:view` | member, staff, board, leader |
 | `profile:read` | member, staff, board, leader |
 | `profile:update_own` | member, staff, board, leader |
-| `notifications:read` | member, staff, board, leader |
+| `notifications:read` | member, staff, board, leader — gates every `/notifications` and `/notification-preferences` route; they only ever act on the caller's own rows (another user's id is a 404) |
 | `dashboard:view` | staff, board, leader |
 | `certificates:read` | staff, board, leader |
 | `certificates:create` | staff, board, leader |

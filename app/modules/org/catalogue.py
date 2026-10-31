@@ -33,6 +33,7 @@ MODULES: list[Module] = [
     Module("hierarchy", "Structure", "parish"),
     Module("media", "Documents", "parish"),
     Module("analytics", "Analytics", "growth"),
+    Module("reports", "Reports", "seed"),
     Module("administration", "Administration", "free", core=True),
 ]
 MODULE_BY_ID = {m.id: m for m in MODULES}

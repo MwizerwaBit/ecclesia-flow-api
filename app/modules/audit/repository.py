@@ -50,3 +50,22 @@ async def get_row_hash(db: Prisma, tenant_id: str | None, chain_seq: int) -> lis
         tenant_id,
         chain_seq,
     )
+
+
+async def list_for_resource(db: Prisma, resource_type: str, resource_id: str, limit: int) -> list[dict]:
+    """A record's history, newest first. Read under the caller's tenant policy,
+    so a church only ever sees its own entries."""
+    return await db.query_raw(
+        """
+        select a.id::text as id, a.action, a.created_at, a.metadata,
+               case when u.id is null then null else u.first_name || ' ' || u.last_name end as actor_name
+        from audit_logs a
+        left join users u on u.id = a.actor_user_id
+        where a.resource_type = $1 and a.resource_id = $2::uuid
+        order by a.created_at desc, a.id desc
+        limit $3
+        """,
+        resource_type,
+        resource_id,
+        limit,
+    )

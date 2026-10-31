@@ -17,18 +17,28 @@ from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import AuditTapMiddleware, RequestIdMiddleware, SecurityHeadersMiddleware
 from app.core.rate_limit import limiter
+from app.modules.activity.reminders import run_forever as send_event_reminders
 from app.modules.billing.reminders import run_forever
+from app.modules.notifications.delivery import run_forever as deliver_notification_emails
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     await connect_clients()
-    reminders = asyncio.create_task(run_forever()) if get_settings().run_background_jobs else None
+    jobs = (
+        [
+            asyncio.create_task(run_forever()),
+            asyncio.create_task(deliver_notification_emails()),
+            asyncio.create_task(send_event_reminders()),
+        ]
+        if get_settings().run_background_jobs
+        else []
+    )
     try:
         yield
     finally:
-        if reminders:
-            reminders.cancel()
+        for job in jobs:
+            job.cancel()
         await disconnect_clients()
 
 

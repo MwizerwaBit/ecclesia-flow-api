@@ -14,6 +14,20 @@ async def resolve_permissions(db: Prisma, role_id: str) -> list[str]:
     return await repository.get_custom_permissions(db, role_id)
 
 
+async def users_with_permission(db: Prisma, tenant_id: str, permission: str) -> list[str]:
+    """Active team members of a church whose role includes `permission` — who to
+    tell about something that needs that permission to act on."""
+    permissions_by_role: dict[str, list[str]] = {}
+    users = []
+    for row in await repository.active_role_assignments(db, tenant_id):
+        role_id = str(row["role_id"])
+        if role_id not in permissions_by_role:
+            permissions_by_role[role_id] = await resolve_permissions(db, role_id)
+        if permission in permissions_by_role[role_id]:
+            users.append(str(row["user_id"]))
+    return users
+
+
 def permission_catalogue() -> list[dict]:
     return PERMISSION_CATALOGUE
 

@@ -8,6 +8,7 @@ from app.core.config import get_settings
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.core.security import hash_refresh_token
 from app.modules.audit.service import write_audit
+from app.modules.notifications import service as notifications_service
 from app.modules.rbac.models import SYSTEM_ROLE_BOARD_ID, SYSTEM_ROLE_LEADER_ID
 from app.modules.rbac.service import resolve_permissions
 from app.modules.team import repository
@@ -197,6 +198,38 @@ async def add_assignment(
 # ───────────────────────────── Leadership transfer ─────────────────────────────
 
 
+TRANSFER_URL = "/staff/team"
+
+
+async def _tell_about_transfer(
+    db: Prisma,
+    tenant_id: str,
+    user_ids: list[str],
+    *,
+    transfer_id: str,
+    actor_user_id: str,
+    type_: str,
+    title: str,
+    body: str,
+    key: str,
+) -> None:
+    """Never the person who did it; `key` makes a repeated step a no-op."""
+    audience = [u for u in dict.fromkeys(user_ids) if u != actor_user_id]
+    if audience:
+        await notifications_service.notify(
+            db,
+            tenant_id,
+            audience,
+            type_,
+            title,
+            body,
+            action_url=TRANSFER_URL,
+            resource=("leadership_transfer", transfer_id),
+            dedupe_key=key,
+            actor_user_id=actor_user_id,
+        )
+
+
 async def get_leadership_transfer(db: Prisma, tenant_id: str) -> dict | None:
     return await repository.get_active_transfer(db, tenant_id)
 
@@ -239,6 +272,19 @@ async def request_leadership_transfer(
         resource_id=transfer["id"],
         metadata={"nominee_membership_id": nominee_membership_id, "required_approvals": transfer["required_approvals"]},
     )
+    await _tell_about_transfer(
+        db,
+        tenant_id,
+        await repository.user_ids_for_memberships(db, tenant_id, eligible),
+        transfer_id=transfer["id"],
+        actor_user_id=requester_user_id,
+        type_="approval",
+        title="Leadership transfer needs your approval",
+        body=f"{leader['first_name']} {leader['last_name']} asked to hand church leadership to "
+        f"{nominee['first_name']} {nominee['last_name']}. "
+        f"{transfer['required_approvals']} approvals are needed.",
+        key=f"team.transfer_requested:{transfer['id']}",
+    )
     return transfer
 
 
@@ -276,6 +322,20 @@ async def approve_leadership_transfer(
         resource_id=transfer_id,
         metadata={"approval_count": len(approvals), "required_approvals": transfer["required_approvals"]},
     )
+    outgoing = await repository.get_membership_row(db, transfer["outgoing_leader_membership_id"])
+    if not completed and outgoing:
+        await _tell_about_transfer(
+            db,
+            tenant_id,
+            [str(outgoing["user_id"])],
+            transfer_id=transfer_id,
+            actor_user_id=approver["user_id"],
+            type_="approval",
+            title="A team member approved the leadership transfer",
+            body=f"{approver['first_name']} {approver['last_name']} approved it "
+            f"({len(approvals)} of {transfer['required_approvals']}).",
+            key=f"team.transfer_approved:{transfer_id}:{approver_membership_id}",
+        )
     if completed:
         await repository.complete_leader_flip(
             db,
@@ -295,6 +355,31 @@ async def approve_leadership_transfer(
                 "nominee_membership_id": transfer["nominee_membership_id"],
             },
         )
+        nominee = await repository.get_membership_row(db, transfer["nominee_membership_id"])
+        if outgoing and nominee:
+            await _tell_about_transfer(
+                db,
+                tenant_id,
+                [str(outgoing["user_id"])],
+                transfer_id=transfer_id,
+                actor_user_id=approver["user_id"],
+                type_="approval",
+                title="Leadership transfer completed",
+                body=f"{nominee['first_name']} {nominee['last_name']} is now the church leader. "
+                "You stay on as an administrator.",
+                key=f"team.transfer_completed:{transfer_id}:outgoing",
+            )
+            await _tell_about_transfer(
+                db,
+                tenant_id,
+                [str(nominee["user_id"])],
+                transfer_id=transfer_id,
+                actor_user_id=approver["user_id"],
+                type_="approval",
+                title="You are now the church leader",
+                body="The leadership transfer was approved. Your access has been updated.",
+                key=f"team.transfer_completed:{transfer_id}:nominee",
+            )
     return await repository.get_transfer_by_id(db, transfer_id)
 
 
@@ -306,6 +391,7 @@ async def cancel_leadership_transfer(db: Prisma, tenant_id: str, transfer_id: st
     leader = await repository.get_leader(db)
     if leader is None or leader["user_id"] != requester_user_id:
         raise ForbiddenError("Only the current church leader can cancel a leadership transfer")
+    was_pending = transfer["status"] == "pending_approvals"
     await repository.cancel_transfer(db, transfer_id)
     await write_audit(
         db,
@@ -315,6 +401,20 @@ async def cancel_leadership_transfer(db: Prisma, tenant_id: str, transfer_id: st
         resource_type="leadership_transfer",
         resource_id=transfer_id,
     )
+    nominee = await repository.get_membership_row(db, transfer["nominee_membership_id"])
+    if was_pending and nominee:
+        await _tell_about_transfer(
+            db,
+            tenant_id,
+            await repository.user_ids_for_memberships(db, tenant_id, list(transfer["eligible_approver_ids"])),
+            transfer_id=transfer_id,
+            actor_user_id=requester_user_id,
+            type_="approval",
+            title="Leadership transfer withdrawn",
+            body=f"{leader['first_name']} {leader['last_name']} withdrew the request to hand leadership to "
+            f"{nominee['first_name']} {nominee['last_name']}. Nothing more is needed from you.",
+            key=f"team.transfer_canceled:{transfer_id}",
+        )
 
 
 # ── Used by other modules (leadership) ─────────────────────────────────

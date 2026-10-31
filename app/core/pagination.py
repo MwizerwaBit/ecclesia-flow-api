@@ -19,7 +19,8 @@ a deterministic order (a unique column last) so pages never overlap or skip.
 
 Pages are currently cut after the endpoint has built its list; pushing
 LIMIT/OFFSET into SQL for the largest tables is a later optimisation that
-doesn't change this contract (TODO.md DIF-06).
+doesn't change this contract (TODO.md DIF-06). An endpoint that already does
+so (``/notifications``) is marked with ``paged_in_sql``.
 """
 
 import inspect
@@ -49,8 +50,8 @@ def _link(request: Request, limit: int, offset: int) -> str:
     return str(request.url.include_query_params(limit=limit, offset=offset))
 
 
-def apply_page(rows: list, page: PageParams, request: Request, response: Response) -> list:
-    total = len(rows)
+def page_headers(request: Request, response: Response, page: PageParams, total: int) -> None:
+    """The pagination headers for a page of ``total`` rows."""
     response.headers["X-Total-Count"] = str(total)
     response.headers["X-Page-Limit"] = str(page.limit)
     response.headers["X-Page-Offset"] = str(page.offset)
@@ -61,7 +62,20 @@ def apply_page(rows: list, page: PageParams, request: Request, response: Respons
         links.append(f'<{_link(request, page.limit, max(page.offset - page.limit, 0))}>; rel="prev"')
     if links:
         response.headers["Link"] = ", ".join(links)
+
+
+def apply_page(rows: list, page: PageParams, request: Request, response: Response) -> list:
+    page_headers(request, response, page, len(rows))
     return rows[page.offset : page.offset + page.limit]
+
+
+def paged_in_sql(endpoint: Callable) -> Callable:
+    """Mark a list endpoint that cuts its own page in SQL (LIMIT/OFFSET plus a
+    COUNT) for a table that can grow without bound. It takes ``PageParams`` and
+    the request/response itself and calls ``page_headers``; ``PaginatedRoute``
+    then leaves it alone instead of slicing the result a second time."""
+    endpoint.__paged_in_sql__ = True
+    return endpoint
 
 
 def _is_list_model(model) -> bool:
@@ -98,6 +112,6 @@ def paginated(endpoint: Callable) -> Callable:
 
 class PaginatedRoute(APIRoute):
     def __init__(self, path: str, endpoint: Callable, **kwargs) -> None:
-        if _is_list_model(kwargs.get("response_model")):
+        if _is_list_model(kwargs.get("response_model")) and not getattr(endpoint, "__paged_in_sql__", False):
             endpoint = paginated(endpoint)
         super().__init__(path, endpoint, **kwargs)

@@ -204,6 +204,8 @@ class SessionResponse(BaseModel):
     permissions: list[str]
     role: str | None
     unit_scope_id: uuid.UUID | None
+    #: Minutes without activity before the app signs this session out (app/core/session_policy.py).
+    idle_timeout_minutes: int = 15
 
 
 class MfaChallengeResponse(BaseModel):

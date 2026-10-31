@@ -501,14 +501,27 @@ async def test_schedule_collisions_count_shared_members_and_flag_leaders(client,
     )
     assert notified.status_code == 200 and notified.json() == 1
 
+    # Asking again about the same clash (from either gathering) reaches nobody new.
+    for event_id, colliding_id in ((youth_event["id"], choir_event["id"]), (choir_event["id"], youth_event["id"])):
+        again = await client.post(
+            "/api/v1/events/notify-conflict",
+            json={"event_id": event_id, "colliding_event_id": colliding_id, "member_ids": [leah_member["id"]]},
+            headers=lead,
+        )
+        assert again.status_code == 200 and again.json() == 0
+
     async with platform_session() as db:
         rows = await db.query_raw(
-            "select title, body, action_url from notifications where tenant_id = $1::uuid and user_id = $2::uuid",
+            "select type, title, body, action_url, resource_type, resource_id, actor_user_id from notifications"
+            " where tenant_id = $1::uuid and user_id = $2::uuid",
             tenant_id,
             leah["user"]["id"],
         )
         assert len(rows) == 1
         assert "Choir practice" in rows[0]["body"] and "Youth night" in rows[0]["body"]
+        assert rows[0]["type"] == "event"
+        assert (rows[0]["resource_type"], rows[0]["resource_id"]) == ("event", youth_event["id"])
+        assert rows[0]["actor_user_id"] == leader["user"]["id"]
 
 
 # ───────────────────────────── Registration forms ─────────────────────────────
